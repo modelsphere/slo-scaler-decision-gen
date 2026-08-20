@@ -1,0 +1,60 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: decision-gen
+  namespace: llm-scaler
+  labels:
+    app: decision-gen
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: decision-gen
+  template:
+    metadata:
+      labels:
+        app: decision-gen
+    spec:
+      serviceAccountName: decision-gen
+      containers:
+        - name: decision-gen
+          image: decision-gen:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 2
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 2
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 256Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: decision-gen
+  namespace: llm-scaler
+  labels:
+    app: decision-gen
+spec:
+  type: ClusterIP
+  selector:
+    app: decision-gen
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
