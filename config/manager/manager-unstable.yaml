@@ -18,7 +18,7 @@ spec:
       serviceAccountName: decision-gen
       containers:
         - name: decision-gen
-          image: harbor.4pd.io/hardcore-tech/llm-scaler-decision-gen:v0.2
+          image: harbor.4pd.io/hardcore-tech/llm-scaler-decision-gen:v0.3
           imagePullPolicy: Always
           ports:
             - name: http

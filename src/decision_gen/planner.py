@@ -88,10 +88,14 @@ def _allocate_in_pool(pool, members, *, wants, current, placement, cr, gap, allo
         tier = by_tier[tier_prio]
         while True:
             progressed = False
+            # D6 — stable tie-break. Deficit desc first; service key asc
+            # next so equal-deficit services don't flap tick to tick.
             order = sorted(
                 tier,
-                key=lambda k: (want_clamped[k] - alloc_out[k]) * gpr[k],
-                reverse=True,
+                key=lambda k: (
+                    -(want_clamped[k] - alloc_out[k]) * gpr[k],
+                    k,
+                ),
             )
             for k in order:
                 if alloc_out[k] >= want_clamped[k]:

@@ -13,8 +13,8 @@ from kubernetes.config.config_exception import ConfigException
 
 from decision_gen.controller import Controller
 from decision_gen.k8s_state import K8sState
-from decision_gen.metrics import Prometheus
 from decision_gen.server import serve
+from decision_gen.signals import Signals
 from decision_gen.slo_store import SLOStore
 
 
@@ -53,12 +53,15 @@ def main():
 
     slo = SLOStore()
     k8s = K8sState()
-    prom = Prometheus(
-        base_url=os.environ.get("PROM_URL", "http://kube-prometheus-stack-prometheus.monitoring:9090"),
+    signals = Signals(
+        base_url=os.environ.get(
+            "PROM_URL",
+            "http://kube-prometheus-stack-prometheus.monitoring:9090",
+        ),
         timeout_s=env_int("PROM_TIMEOUT_S", 5),
     )
     controller = Controller(
-        slo=slo, k8s=k8s, prom=prom, tick_seconds=tick_seconds,
+        slo=slo, k8s=k8s, signals=signals, tick_seconds=tick_seconds,
     )
 
     try:
