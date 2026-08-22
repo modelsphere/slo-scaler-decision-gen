@@ -1,0 +1,63 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: decision-gen-unstable
+  namespace: llm-scaler
+  labels:
+    app: decision-gen-unstable
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: decision-gen-unstable
+  template:
+    metadata:
+      labels:
+        app: decision-gen-unstable
+    spec:
+      serviceAccountName: decision-gen
+      containers:
+        - name: decision-gen
+          image: harbor.4pd.io/hardcore-tech/llm-scaler-decision-gen:v0.2
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 2
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 2
+            periodSeconds: 10
+          env:
+            - name: LOG_LEVEL
+              value: "DEBUG"
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 256Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: decision-gen-unstable
+  namespace: llm-scaler
+  labels:
+    app: decision-gen-unstable
+spec:
+  type: ClusterIP
+  selector:
+    app: decision-gen-unstable
+  ports:
+    - name: http
+      port: 80
+      targetPort: http

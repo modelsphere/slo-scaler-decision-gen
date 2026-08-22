@@ -8,6 +8,9 @@ Process layout:
 import logging
 import os
 
+from kubernetes import config as kube_config
+from kubernetes.config.config_exception import ConfigException
+
 from decision_gen.controller import Controller
 from decision_gen.k8s_state import K8sState
 from decision_gen.metrics import Prometheus
@@ -19,15 +22,34 @@ def env_int(name, default):
     return int(os.environ.get(name, default))
 
 
-def main():
+def _configure_logging():
+    """Apply LOG_LEVEL to our loggers only. Third-party libraries spew
+    raw response bodies at DEBUG (kubernetes.client.rest dumps the full
+    HTTP body of every API call), which buries our own logs. Cap them
+    at WARNING so their errors still surface."""
     logging.basicConfig(
         level=os.environ.get("LOG_LEVEL", "INFO"),
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
+    for name in ("kubernetes", "urllib3", "requests"):
+        logging.getLogger(name).setLevel(logging.WARNING)
+
+
+def main():
+    _configure_logging()
     log = logging.getLogger("decision_gen")
 
     port = env_int("PORT", 8080)
     tick_seconds = env_int("TICK_SECONDS", 60)
+
+    # Kubernetes client config. In-cluster when running as a pod;
+    # fall back to local kubeconfig for `make run` development.
+    try:
+        kube_config.load_incluster_config()
+        log.info("kubernetes: using in-cluster config")
+    except ConfigException:
+        kube_config.load_kube_config()
+        log.info("kubernetes: using local kubeconfig")
 
     slo = SLOStore()
     k8s = K8sState()

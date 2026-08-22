@@ -217,6 +217,42 @@ def test_deployment_pool_from_affinity():
     assert p.pool == POOL_A100
 
 
+def test_deployment_pool_from_affinity_snake_case():
+    """kubernetes-python's to_dict() emits snake_case keys for nested
+    sub-objects (attribute names), not JSON/camelCase keys. The canonical
+    example was modelforge-fallback-sglang: pool sat under
+    node_affinity.required_during_scheduling_ignored_during_execution.
+    Guard against regression — this is the shape we see in production."""
+    snake_affinity = {
+        "node_affinity": {
+            "required_during_scheduling_ignored_during_execution": {
+                "node_selector_terms": [{
+                    "match_expressions": [{
+                        "key": "nvidia.com/gpu.product",
+                        "operator": "In",
+                        "values": [POOL_H100],
+                    }],
+                }],
+            },
+        },
+    }
+    deploy = {"spec": {"template": {
+        "spec": {
+            "affinity": snake_affinity,
+            "containers": [{
+                "name": "main",
+                "resources": {"limits": {"nvidia.com/gpu": 2}},
+            }],
+        },
+    }}}
+    apps, core, custom = _fake_apis(deploy=deploy)
+    state = K8sState(apps_v1=apps, core_v1=core, custom_v1=custom)
+    p = state.resolve_placement("kimi", "kimi-k25")
+    assert p is not None
+    assert p.pool == POOL_H100
+    assert p.gpus_per_replica == 2
+
+
 # ---------- pool_capacity ----------
 
 def _node(name, pool, gpu_allocatable, ready=True, cordoned=False, present="true"):

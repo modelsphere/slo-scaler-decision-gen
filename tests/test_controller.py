@@ -39,9 +39,9 @@ def _cr(min_v=1, max_v=4, priority=5, ttft_metrics=None, otps_metrics=None):
     }
 
 
-def _healthy_prom(prom, current=2, ttft_ms=10.0, otps=15.0, rej=0.0):
+def _healthy_prom(prom, current=2, ttft_s=10.0, otps=15.0, rej=0.0):
     prom.current_replicas_fn = lambda ns, svc: current
-    prom.ttft_fn = lambda ns, svc, kind: ttft_ms
+    prom.ttft_fn = lambda ns, svc, kind: ttft_s
     prom.otps_fn = lambda ns, svc, kind: otps
     prom.rejection_rate_fn = lambda ns, svc: rej
 
@@ -116,7 +116,13 @@ def test_nan_on_one_service_doesnt_affect_another(fake_slo_store, fake_prom, fak
     c._tick()
     rows = {d["serviceId"]: d for d in c.snapshot()["decisions"]}
     assert rows["kimi-k25"]["replicas"]["active"] == 1   # hold
-    assert rows["fb"]["replicas"]["active"] == 2         # scaled up (violation)
+    assert rows["fb"]["replicas"]["active"] == 1         # hold: up-cooldown still gated
+
+    # Give fb enough idle time for the up-cooldown; second tick scales it.
+    c._last_change_at[("modelforge", "fb")] = time_module.time() - est_mod.SCALE_UP_COOLDOWN_S
+    c._tick()
+    rows = {d["serviceId"]: d for d in c.snapshot()["decisions"]}
+    assert rows["fb"]["replicas"]["active"] == 2         # violation now scales
 
 
 def test_missing_current_replicas_falls_back_to_last_served(
@@ -147,7 +153,7 @@ def test_missing_current_replicas_seeds_from_workload_spec(
     fake_slo_store.set("kimi", "kimi-k25", _cr(min_v=1, max_v=4))
     fake_k8s.placements[("kimi", "kimi-k25")] = _placement(spec_replicas=3)
     fake_k8s.capacity[POOL] = 32
-    _healthy_prom(fake_prom, current=2, ttft_ms=5.0)
+    _healthy_prom(fake_prom, current=2, ttft_s=5.0)
     fake_prom.current_replicas_fn = lambda ns, svc: None   # Prom is dark
 
     c = Controller(slo=fake_slo_store, k8s=fake_k8s, prom=fake_prom)
@@ -168,7 +174,7 @@ def test_boot_seed_within_bounds_uses_spec(
     fake_slo_store.set("kimi", "kimi-k25", _cr(min_v=1, max_v=4))
     fake_k8s.placements[("kimi", "kimi-k25")] = _placement(spec_replicas=3)
     fake_k8s.capacity[POOL] = 32
-    _healthy_prom(fake_prom, current=3, ttft_ms=5.0)
+    _healthy_prom(fake_prom, current=3, ttft_s=5.0)
 
     c = Controller(slo=fake_slo_store, k8s=fake_k8s, prom=fake_prom)
     c._tick()
@@ -182,7 +188,7 @@ def test_boot_seed_above_max_clamps_down(
     fake_slo_store.set("kimi", "kimi-k25", _cr(min_v=1, max_v=2))
     fake_k8s.placements[("kimi", "kimi-k25")] = _placement(spec_replicas=5)
     fake_k8s.capacity[POOL] = 64
-    _healthy_prom(fake_prom, current=5, ttft_ms=5.0)
+    _healthy_prom(fake_prom, current=5, ttft_s=5.0)
 
     c = Controller(slo=fake_slo_store, k8s=fake_k8s, prom=fake_prom)
     c._tick()
@@ -199,7 +205,7 @@ def test_boot_seed_below_min_clamps_up(
     fake_slo_store.set("kimi", "kimi-k25", _cr(min_v=2, max_v=4))
     fake_k8s.placements[("kimi", "kimi-k25")] = _placement(spec_replicas=0)
     fake_k8s.capacity[POOL] = 64
-    _healthy_prom(fake_prom, current=0, ttft_ms=5.0)
+    _healthy_prom(fake_prom, current=0, ttft_s=5.0)
 
     c = Controller(slo=fake_slo_store, k8s=fake_k8s, prom=fake_prom)
     c._tick()
@@ -214,7 +220,7 @@ def test_boot_seed_min_zero_respects_shutdown(
     fake_slo_store.set("kimi", "kimi-k25", _cr(min_v=0, max_v=4))
     fake_k8s.placements[("kimi", "kimi-k25")] = _placement(spec_replicas=0)
     fake_k8s.capacity[POOL] = 32
-    _healthy_prom(fake_prom, current=0, ttft_ms=5.0)
+    _healthy_prom(fake_prom, current=0, ttft_s=5.0)
 
     c = Controller(slo=fake_slo_store, k8s=fake_k8s, prom=fake_prom)
     c._tick()
@@ -236,8 +242,8 @@ def test_boot_freeze_healthy_service_holds(
     fake_slo_store.set("kimi", "kimi-k25", _cr(min_v=1, max_v=4))
     fake_k8s.placements[("kimi", "kimi-k25")] = _placement(spec_replicas=3)
     fake_k8s.capacity[POOL] = 64
-    # Unambiguously comfortable: 5ms < 20*0.5 and 10 < 30*0.5.
-    _healthy_prom(fake_prom, current=3, ttft_ms=5.0, otps=10.0, rej=0.0)
+    # Unambiguously comfortable: ttft 5 < 20*0.5=10; otps 61 > 30/0.5=60.
+    _healthy_prom(fake_prom, current=3, ttft_s=5.0, otps=61.0, rej=0.0)
 
     c = Controller(slo=fake_slo_store, k8s=fake_k8s, prom=fake_prom)
     for _ in range(3):   # several ticks, same story
@@ -256,25 +262,27 @@ def test_boot_freeze_expires_after_cooldown_window(
     fake_slo_store.set("kimi", "kimi-k25", _cr(min_v=1, max_v=4))
     fake_k8s.placements[("kimi", "kimi-k25")] = _placement(spec_replicas=3)
     fake_k8s.capacity[POOL] = 64
-    _healthy_prom(fake_prom, current=3, ttft_ms=5.0, otps=10.0, rej=0.0)
+    _healthy_prom(fake_prom, current=3, ttft_s=5.0, otps=61.0, rej=0.0)
 
     c = Controller(slo=fake_slo_store, k8s=fake_k8s, prom=fake_prom)
     c._tick()
     assert c.snapshot()["decisions"][0]["replicas"]["active"] == 3
 
-    # Simulate the cooldown window elapsing since the seed.
+    # Simulate the cooldown window elapsing since the seed, AND seed the
+    # comfort tracker so rule 3's 30-min gate is satisfied.
     c._last_change_at[("kimi", "kimi-k25")] = 0
+    c._comfortable_since[("kimi", "kimi-k25")] = 0
     c._tick()
     rows = {d["serviceId"]: d for d in c.snapshot()["decisions"]}
     assert rows["kimi-k25"]["replicas"]["active"] == 2   # now allowed
 
 
-def test_boot_freeze_does_not_block_scale_up(
+def test_violation_during_boot_shed_freeze_holds_until_up_cooldown(
     fake_slo_store, fake_prom, fake_k8s,
 ):
-    """The freeze only blocks scale-DOWN. A fresh service that is
-    melting (SLO violated or rejection spike) still scales up on its
-    first managed tick."""
+    """Boot freeze gates rule 2 for SCALE_UP_COOLDOWN_S after the seed —
+    SLO-following-up only kicks in after that window. Rule 1 (rejection
+    spike) is always fire-alarm and not gated by this freeze."""
     fake_slo_store.set("kimi", "kimi-k25", _cr(min_v=1, max_v=6))
     fake_k8s.placements[("kimi", "kimi-k25")] = _placement(spec_replicas=2)
     fake_k8s.capacity[POOL] = 64
@@ -286,7 +294,15 @@ def test_boot_freeze_does_not_block_scale_up(
     c = Controller(slo=fake_slo_store, k8s=fake_k8s, prom=fake_prom)
     c._tick()
     rows = {d["serviceId"]: d for d in c.snapshot()["decisions"]}
-    assert rows["kimi-k25"]["replicas"]["active"] == 3   # +1 on tick 1
+    assert rows["kimi-k25"]["replicas"]["active"] == 2   # hold: up-cooldown gated
+
+    # Let the up-cooldown elapse — then the violation scales.
+    c._last_change_at[("kimi", "kimi-k25")] = (
+        time_module.time() - est_mod.SCALE_UP_COOLDOWN_S
+    )
+    c._tick()
+    rows = {d["serviceId"]: d for d in c.snapshot()["decisions"]}
+    assert rows["kimi-k25"]["replicas"]["active"] == 3
 
 
 # ---------- direction rule (shed freeze) ----------
@@ -306,9 +322,19 @@ def test_direction_rampup_slo_violation_freezes_at_booked(
 
     c = Controller(slo=fake_slo_store, k8s=fake_k8s, prom=fake_prom)
     c._tick()
+    # Tick 1: boot seeds ledger=10; violation is up-cooldown gated → hold.
+    rows = {d["serviceId"]: d for d in c.snapshot()["decisions"]}
+    assert rows["kimi-k25"]["replicas"]["active"] == 10
+
+    # Tick 2: up-cooldown elapsed → estimator proposes +1 off prom=8 →
+    # desired=9 < booked=10 → direction rule freezes at 10.
+    c._last_change_at[("kimi", "kimi-k25")] = (
+        time_module.time() - est_mod.SCALE_UP_COOLDOWN_S
+    )
+    c._tick()
     rows = {d["serviceId"]: d for d in c.snapshot()["decisions"]}
     # Estimator wanted 8+1=9 < booked=10, but direction-vs-ledger froze it.
-    # Without the rule 4 freeze, it would commit 9 and revoke the pending pod.
+    # Without the freeze we'd commit 9 and revoke the pending pod.
     assert rows["kimi-k25"]["replicas"]["active"] == 10
 
 
@@ -328,8 +354,10 @@ def test_direction_rampup_rejection_spike_still_scales_up(
     c = Controller(slo=fake_slo_store, k8s=fake_k8s, prom=fake_prom)
     c._tick()
     rows = {d["serviceId"]: d for d in c.snapshot()["decisions"]}
-    # ceil(8 × 1.5) = 12 > booked=10 → up path, allowed.
-    assert rows["kimi-k25"]["replicas"]["active"] == 12
+    # rej=0.05 is at threshold, mult = 1+2·(0.05/0.95) ≈ 1.105.
+    # desired = max(ceil(8×1.105), 8+1) = 9 < booked=10 → direction rule
+    # lifts to 10 (the freeze: rule-1 spikes below booked don't shed).
+    assert rows["kimi-k25"]["replicas"]["active"] == 10
 
 
 def test_direction_scale_down_via_rule3_still_works(
@@ -340,15 +368,17 @@ def test_direction_scale_down_via_rule3_still_works(
     fake_slo_store.set("kimi", "kimi-k25", _cr(min_v=1, max_v=4))
     fake_k8s.placements[("kimi", "kimi-k25")] = _placement(spec_replicas=2)
     fake_k8s.capacity[POOL] = 32
-    _healthy_prom(fake_prom, current=2, ttft_ms=5.0, otps=10.0, rej=0.0)
+    _healthy_prom(fake_prom, current=2, ttft_s=5.0, otps=61.0, rej=0.0)
 
     c = Controller(slo=fake_slo_store, k8s=fake_k8s, prom=fake_prom)
     c._tick()
     rows = {d["serviceId"]: d for d in c.snapshot()["decisions"]}
     assert rows["kimi-k25"]["replicas"]["active"] == 2   # frozen during cooldown
 
-    # Force cooldown elapsed + comfort + quiet → rule 3 fires → shed.
+    # Force cooldown elapsed + comfort + quiet + 30-min comfort window →
+    # rule 3 fires → shed.
     c._last_change_at[("kimi", "kimi-k25")] = 0
+    c._comfortable_since[("kimi", "kimi-k25")] = 0
     c._tick()
     rows = {d["serviceId"]: d for d in c.snapshot()["decisions"]}
     assert rows["kimi-k25"]["replicas"]["active"] == 1
@@ -386,7 +416,7 @@ def test_direction_max_shrink_bypasses_freeze(
     fake_slo_store.set("kimi", "kimi-k25", _cr(min_v=1, max_v=4))
     fake_k8s.placements[("kimi", "kimi-k25")] = _placement(spec_replicas=10)
     fake_k8s.capacity[POOL] = 96
-    _healthy_prom(fake_prom, current=10, ttft_ms=5.0)
+    _healthy_prom(fake_prom, current=10, ttft_s=5.0)
 
     c = Controller(slo=fake_slo_store, k8s=fake_k8s, prom=fake_prom)
     c._tick()
@@ -414,7 +444,7 @@ def test_direction_nan_signals_freeze_capped_by_max(
     fake_slo_store.set("kimi", "kimi-k25", _cr(min_v=1, max_v=4))
     fake_k8s.placements[("kimi", "kimi-k25")] = _placement(spec_replicas=4)
     fake_k8s.capacity[POOL] = 64
-    _healthy_prom(fake_prom, current=4, ttft_ms=5.0)
+    _healthy_prom(fake_prom, current=4, ttft_s=5.0)
 
     c = Controller(slo=fake_slo_store, k8s=fake_k8s, prom=fake_prom)
     c._tick()
@@ -449,6 +479,16 @@ def test_preemption_shed_commits_without_freeze(
     c = Controller(slo=fake_slo_store, k8s=fake_k8s, prom=fake_prom)
     c._tick()
     rows = {d["serviceId"]: d for d in c.snapshot()["decisions"]}
+    # hi: ttft violated but up-cooldown gated → want = booked = 1 (no preemption).
+    # lo: comfortable but cooldown gated → hold 4.
+    assert rows["hi"]["replicas"]["active"] == 1
+    assert rows["lo"]["replicas"]["active"] == 4
+
+    # Let hi's up-cooldown elapse → estimator now scales hi up → planner
+    # preempts lo to fund the bump.
+    c._last_change_at[("kimi", "hi")] = time_module.time() - est_mod.SCALE_UP_COOLDOWN_S
+    c._tick()
+    rows = {d["serviceId"]: d for d in c.snapshot()["decisions"]}
     # hi: est +1 → want 2, committed 2 (planner preempts lo).
     # lo: est comfortable-but-cooldown → want = booked = 4. Planner sheds 4→3.
     assert rows["hi"]["replicas"]["active"] == 2
@@ -471,8 +511,17 @@ def test_violation_scales_up_via_controller(fake_slo_store, fake_prom, fake_k8s)
 
     c = Controller(slo=fake_slo_store, k8s=fake_k8s, prom=fake_prom)
     c._tick()
+    # Tick 1: boot stamp; violation gated by up-cooldown → hold at booked.
     rows = {d["serviceId"]: d for d in c.snapshot()["decisions"]}
-    assert rows["kimi-k25"]["replicas"]["active"] == 3   # +1 step
+    assert rows["kimi-k25"]["replicas"]["active"] == 2
+
+    # Tick 2: up-cooldown elapsed → violation scales +1.
+    c._last_change_at[("kimi", "kimi-k25")] = (
+        time_module.time() - est_mod.SCALE_UP_COOLDOWN_S
+    )
+    c._tick()
+    rows = {d["serviceId"]: d for d in c.snapshot()["decisions"]}
+    assert rows["kimi-k25"]["replicas"]["active"] == 3
 
 
 def test_rejection_spike_scales_up_multiplicatively(fake_slo_store, fake_prom, fake_k8s):
@@ -487,7 +536,9 @@ def test_rejection_spike_scales_up_multiplicatively(fake_slo_store, fake_prom, f
     c = Controller(slo=fake_slo_store, k8s=fake_k8s, prom=fake_prom)
     c._tick()
     rows = {d["serviceId"]: d for d in c.snapshot()["decisions"]}
-    assert rows["kimi-k25"]["replicas"]["active"] == 3   # ceil(2*1.5)
+    # rej=0.05 is at threshold, mult ≈ 1.105. ceil(2×1.105)=3, and the
+    # +1 floor would also give 3 — either way we grow by 1.
+    assert rows["kimi-k25"]["replicas"]["active"] == 3
 
 
 # ---------- cooldown bookkeeping ----------
@@ -514,8 +565,12 @@ def test_cooldown_updated_only_when_planner_changes_value(
     assert ("kimi", "kimi-k25") in c._last_change_at
     seed_stamp = c._last_change_at[("kimi", "kimi-k25")]
 
-        # Give capacity; planner moves 1 → 2 → stamp advances.
+    # Give capacity AND let the up-cooldown elapse; planner moves 1 → 2
+    # → stamp advances.
     fake_k8s.capacity[POOL] = 32
+    c._last_change_at[("kimi", "kimi-k25")] = (
+        time_module.time() - est_mod.SCALE_UP_COOLDOWN_S
+    )
     time_module.sleep(0.01)
     c._tick()
     assert c._last_change_at[("kimi", "kimi-k25")] > seed_stamp
@@ -570,26 +625,36 @@ def test_three_tick_lifecycle(fake_slo_store, fake_prom, fake_k8s):
     fake_k8s.placements[("kimi", "kimi-k25")] = _placement(spec_replicas=1)
     fake_k8s.capacity[POOL] = 32
     fake_prom.current_replicas_fn = lambda ns, svc: 1
-    fake_prom.otps_fn = lambda ns, svc, kind: 10.0
+    fake_prom.otps_fn = lambda ns, svc, kind: 61.0
     fake_prom.rejection_rate_fn = lambda ns, svc: 0.0
 
     c = Controller(slo=fake_slo_store, k8s=fake_k8s, prom=fake_prom)
 
-    # tick 1: ttft violated → +1
+    # Tick 1: boot seeds ledger=1; violation is up-cooldown gated → hold.
     fake_prom.ttft_fn = lambda ns, svc, kind: 50.0
+    c._tick()
+    rows = {d["serviceId"]: d for d in c.snapshot()["decisions"]}
+    assert rows["kimi-k25"]["replicas"]["active"] == 1
+
+    # Tick 2: up-cooldown elapsed → violation scales +1.
+    c._last_change_at[("kimi", "kimi-k25")] = (
+        time_module.time() - est_mod.SCALE_UP_COOLDOWN_S
+    )
     c._tick()
     rows = {d["serviceId"]: d for d in c.snapshot()["decisions"]}
     assert rows["kimi-k25"]["replicas"]["active"] == 2
 
-    # tick 2: everything fine, but cooldown active from tick 1's change
+    # Tick 3: everything fine, but up/down cooldowns active from tick 2's change.
     fake_prom.ttft_fn = lambda ns, svc, kind: 5.0
     fake_prom.current_replicas_fn = lambda ns, svc: 2
     c._tick()
     rows = {d["serviceId"]: d for d in c.snapshot()["decisions"]}
     assert rows["kimi-k25"]["replicas"]["active"] == 2   # hold, cooldown
 
-    # tick 3: pretend time has moved past cooldown
+    # Tick 4: pretend time has moved past down-cooldown (implies up too),
+    # and that the comfort window has also elapsed.
     c._last_change_at[("kimi", "kimi-k25")] = 0   # force elapsed
+    c._comfortable_since[("kimi", "kimi-k25")] = 0
     c._tick()
     rows = {d["serviceId"]: d for d in c.snapshot()["decisions"]}
     assert rows["kimi-k25"]["replicas"]["active"] == 1   # scale down

@@ -61,6 +61,7 @@ class Controller:
         self._snapshot = {"apiVersion": API_VERSION, "decisions": []}
         self._last_change_at = {}      # svc_key → epoch
         self._last_served = {}         # svc_key → int (replicas we last put on the wire)
+        self._comfortable_since = {}   # svc_key → epoch of start of unbroken comfort
         self._stop = threading.Event()
         self._thread = None
 
@@ -106,6 +107,7 @@ class Controller:
             if key not in crs:
                 del self._last_served[key]
                 self._last_change_at.pop(key, None)
+                self._comfortable_since.pop(key, None)
                 log.info("%s/%s: CR deleted; freed ledger entry", *key)
 
         if not crs:
@@ -189,6 +191,29 @@ class Controller:
                 + list(signals["otps"].values())
             )
             partial_missing = any(estimator.is_no_signal(v) for v in flat_signals)
+
+            # Sustained-comfort tracker: rule 3 needs 30 min of continuous
+            # comfortable signals before it'll shed. Reset on missing data,
+            # advancing on fully-comfortable ticks. Comfortable is the same
+            # test rule 3 uses internally (no rejection, both SLO blocks
+            # comfortable with SLO_HEADROOM margin).
+            ttft_block = (spec.get("ttft") or {}).get("default")
+            otps_block = (spec.get("otps") or {}).get("default")
+            if partial_missing:
+                comfortable = False
+            else:
+                rej_val = signals.get("rejection_rate")
+                comfortable = (
+                    (estimator.is_no_signal(rej_val)
+                     or rej_val < estimator.REJECTION_OK_FLOOR)
+                    and estimator.slo_comfortably_met(ttft_block, signals["ttft"], "ceiling")
+                    and estimator.slo_comfortably_met(otps_block, signals["otps"], "floor")
+                )
+            if comfortable:
+                self._comfortable_since.setdefault(key, now)
+            else:
+                self._comfortable_since.pop(key, None)
+
             if partial_missing:
                 want = _sanitize_hold(booked_current, bounds)
                 wants[key] = want
@@ -198,14 +223,24 @@ class Controller:
                 log_rows.append(
                     f"{ns}/{svc}:hold-no-signal booked={booked_current}",
                 )
+                missing = [k for k, v in list(signals["ttft"].items()) + list(signals["otps"].items())
+                           if estimator.is_no_signal(v)]
+                log.debug(
+                    "%s/%s: hold (missing %s) booked=%d prom=%s",
+                    ns, svc,
+                    ",".join(missing) if missing else "?",
+                    booked_current,
+                    prom_current if prom_current is not None else "?",
+                )
                 continue
 
-            desired, reason = estimator.decide(
+            est, reason = estimator.decide(
                 cr_spec=spec,
                 signals=signals,
                 current_replicas=prom_current,
                 last_change_at=self._last_change_at.get(key, 0),
                 now=now,
+                comfortable_since=self._comfortable_since.get(key),
             )
 
             # Direction rule: magnitude from prom (estimator), direction
@@ -215,17 +250,20 @@ class Controller:
             # output below `booked` is untouched — preemption sheds are
             # legitimate by construction and the cooldown timer already
             # re-anchors when they land.
-            if desired < booked_current and not reason.startswith("scale-down"):
+            if est < booked_current and not reason.startswith("scale-down"):
                 want = _sanitize_hold(booked_current, bounds)
                 reason = f"freeze-shed {reason}"
             else:
-                want = desired
+                want = est
             wants[key] = want
             booked[key] = booked_current
             placements[key] = (placement.pool, placement.gpus_per_replica)
             cr_bounds[key] = bounds
+            log.debug(
+                "%s/%s: est=%d → want=%d (%s)", ns, svc, est, want, reason,
+            )
             log_rows.append(
-                f"{ns}/{svc}:est {booked_current}→{want} {reason}",
+                f"{ns}/{svc}:est={est} want={want} ({reason})",
             )
 
         # Ledger gap: total − Σ booked (priced at this tick's gpr).
@@ -239,6 +277,11 @@ class Controller:
             placement=placements, cr=cr_bounds, gap=gap,
         )
 
+        for k, v in sorted(alloc.items()):
+            log.debug(
+                "%s/%s: want=%d → alloc=%d", k[0], k[1], wants.get(k, 0), v,
+            )
+
         # Cooldown bookkeeping: stamp only when the planner moves a
         # service relative to what it walked in with this tick. Seeding
         # the ledger from Prometheus and holding-steady both leave the
@@ -246,6 +289,7 @@ class Controller:
         for k, v in alloc.items():
             if booked.get(k) != v:
                 self._last_change_at[k] = now
+                self._comfortable_since.pop(k, None)
             self._last_served[k] = v
 
         payload = {

@@ -26,10 +26,11 @@ def _row(value):
 def test_ttft_avg_template():
     with patch("decision_gen.metrics.requests.get", return_value=_resp([_row(0.25)])) as get:
         v = _prom().ttft("kimi", "kimi-k25", "avg")
-    assert v == 250.0
+    assert v == 0.25   # seconds; no conversion to ms
     q = get.call_args.kwargs["params"]["query"]
     assert 'service="kimi/kimi-k25"' in q
-    assert 'stream="true"' in q
+    # NOT filtering on stream — live exporters sometimes omit the label.
+    assert 'stream=' not in q
     assert 'bodylog_ttft_seconds_sum' in q
     assert 'bodylog_ttft_seconds_count' in q
     assert '[5m]' in q
@@ -38,13 +39,14 @@ def test_ttft_avg_template():
 def test_ttft_percentile_template():
     with patch("decision_gen.metrics.requests.get", return_value=_resp([_row(0.035)])) as get:
         v = _prom().ttft("kimi", "kimi-k25", "p95")
-    assert v == 35.0
+    assert v == 0.035   # seconds; no conversion to ms
     q = get.call_args.kwargs["params"]["query"]
     assert q.startswith("histogram_quantile(0.95,")
     assert 'bodylog_ttft_seconds_bucket' in q
     assert 'sum by(le)' in q
     assert 'service="kimi/kimi-k25"' in q
-    assert 'stream="true"' in q
+    # NOT filtering on stream — live exporters sometimes omit the label.
+    assert 'stream=' not in q
 
 
 def test_otps_avg_template():
@@ -76,7 +78,7 @@ def test_rejection_rate_template():
     assert 'openresty_rejected_total' in q
     assert 'clamp_min' in q
     assert 'backend!="(none)"' in q
-    assert '[1m]' in q
+    assert '[2m]' in q
 
 
 def test_current_replicas_template():
@@ -127,14 +129,14 @@ def test_ttft_nan_passes_through():
     assert math.isnan(v)
 
 
-def test_ttft_converts_seconds_to_milliseconds():
-    """The PromQL series is in seconds; estimator wants ms."""
-    with patch("decision_gen.metrics.requests.get", return_value=_resp([_row(0.020)])):
-        assert _prom().ttft("kimi", "kimi-k25", "p80") == 20.0
+def test_ttft_passes_through_seconds():
+    """The PromQL series is seconds; CR thresholds are seconds; no conversion."""
+    with patch("decision_gen.metrics.requests.get", return_value=_resp([_row(8.5)])):
+        assert _prom().ttft("kimi", "kimi-k25", "p80") == 8.5
 
 
-def test_otps_does_not_convert_units():
-    """OTPS is already in the right unit (tokens/s per request)."""
+def test_otps_passes_through_tokens_per_second():
+    """OTPS series and CR thresholds share the same unit (tokens/s)."""
     with patch("decision_gen.metrics.requests.get", return_value=_resp([_row(30.0)])):
         assert _prom().otps("kimi", "kimi-k25", "p80") == 30.0
 

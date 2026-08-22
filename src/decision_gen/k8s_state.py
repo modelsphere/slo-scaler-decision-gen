@@ -96,6 +96,9 @@ class K8sState:
         if lws is not None:
             placement = self._placement_from_lws(namespace, target_name, lws)
             if placement is not None:
+                log.debug("%s/%s: lws pool=%s gpr=%d spec_replicas=%d",
+                          namespace, service_id, placement.pool,
+                          placement.gpus_per_replica, placement.spec_replicas)
                 return placement
             # LWS exists but is malformed → unmanageable here; don't fall through
             log.warning(
@@ -116,6 +119,9 @@ class K8sState:
                 spec_replicas=int(sts_spec.get("replicas", 1)),
             )
             if placement is not None:
+                log.debug("%s/%s: sts pool=%s gpr=%d spec_replicas=%d",
+                          namespace, service_id, placement.pool,
+                          placement.gpus_per_replica, placement.spec_replicas)
                 return placement
             log.warning(
                 "StatefulSet %s/%s exists but malformed; service %s unmanageable this tick",
@@ -133,6 +139,9 @@ class K8sState:
                 spec_replicas=int(deploy_spec.get("replicas", 0)),
             )
             if placement is not None:
+                log.debug("%s/%s: deploy pool=%s gpr=%d spec_replicas=%d",
+                          namespace, service_id, placement.pool,
+                          placement.gpus_per_replica, placement.spec_replicas)
                 return placement
             log.warning(
                 "Deployment %s/%s exists but malformed; service %s unmanageable this tick",
@@ -243,14 +252,28 @@ class K8sState:
 
     @staticmethod
     def _extract_pool_from_affinity(affinity):
+        """Pool = the single GPU-product value the workload pins to.
+
+        kubernetes-python's `.to_dict()` uses the *attribute* name
+        (snake_case) for nested sub-objects, not the JSON key (camelCase).
+        LWS custom objects come through as plain dicts — JSON keys. Accept
+        both. A missing or ambiguous pool returns None (workload is
+        unmanageable this tick).
+        """
         if not affinity:
             return None
-        node_aff = (affinity.get("nodeAffinity") or {})
-        req = node_aff.get("requiredDuringSchedulingIgnoredDuringExecution") or {}
-        terms = req.get("nodeSelectorTerms") or []
+        node_aff = (affinity.get("nodeAffinity")
+                    or affinity.get("node_affinity") or {})
+        req = (node_aff.get("requiredDuringSchedulingIgnoredDuringExecution")
+               or node_aff.get("required_during_scheduling_ignored_during_execution")
+               or {})
+        terms = (req.get("nodeSelectorTerms")
+                 or req.get("node_selector_terms") or [])
         values = []
         for t in terms:
-            for me in (t.get("matchExpressions") or []):
+            mes = (t.get("matchExpressions")
+                   or t.get("match_expressions") or [])
+            for me in mes:
                 if me.get("key") == GPU_PRODUCT_LABEL and me.get("operator") == "In":
                     values.extend(me.get("values") or [])
         values = sorted(set(values))
@@ -294,4 +317,9 @@ class K8sState:
             except (TypeError, ValueError):
                 gpus = 0
             pools[product] = pools.get(product, 0) + gpus
+        if pools:
+            summary = ", ".join(f"{p}={n}" for p, n in sorted(pools.items()))
+            log.info("pool_capacity: %s", summary)
+        else:
+            log.warning("pool_capacity: no GPU nodes found")
         return pools

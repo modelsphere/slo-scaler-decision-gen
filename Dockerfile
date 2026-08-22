@@ -4,7 +4,7 @@ WORKDIR /app
 COPY pyproject.toml .
 COPY src ./src
 
-RUN pip install --no-cache-dir .
+RUN pip install --no-cache-dir -i https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple .
 
 EXPOSE 8080
 USER 65534:65534
