@@ -70,10 +70,10 @@ def _to_dict(obj):
 class K8sState:
     # Hardcoded aliases: (namespace, service_id) -> workload name.
     # Consulted first during resolution. Remove as the cluster fixes
-    # workload naming to match serviceId.
-    WORKLOAD_ALIASES = {
-        ("modelforge", "fallback-modelforge-01"): "modelforge-fallback-sglang",
-    }
+    # workload naming to match serviceId. NOTE: a stale alias that points
+    # at a deleted/renamed workload is worse than no alias — resolution
+    # will try the alias name (404s everywhere) and never try serviceId.
+    WORKLOAD_ALIASES = {}
 
     def __init__(self, apps_v1=None, core_v1=None, custom_v1=None):
         """Dependency-injectable for tests."""

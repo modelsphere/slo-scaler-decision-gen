@@ -110,7 +110,10 @@ def test_lws_found_first_beats_sts():
     assert p.gpus_per_replica == 16   # size=2 × per_pod=8
 
 
-def test_alias_resolves_to_deployment():
+def test_resolve_by_service_id_when_no_alias():
+    """Aliases are empty; resolution must look up the serviceId directly.
+    Regression: an earlier hard-coded alias pointed at a workload that was
+    renamed, 404'd everywhere, and masked a perfectly resolvable serviceId."""
     deploy = {"spec": {"template": _pod_template(gpu_limit=2)}}
     apps, core, custom = _fake_apis(deploy=deploy)
     state = K8sState(apps_v1=apps, core_v1=core, custom_v1=custom)
@@ -118,9 +121,9 @@ def test_alias_resolves_to_deployment():
     assert p is not None
     assert p.kind == "deployment"
     assert p.gpus_per_replica == 2
-    # confirm alias name was used, not the serviceId
+    # serviceId was used directly as the workload name (aliases are {}).
     call_args = apps.read_namespaced_deployment.call_args
-    assert call_args.args[0] == "modelforge-fallback-sglang"
+    assert call_args.args[0] == "fallback-modelforge-01"
     assert call_args.args[1] == "modelforge"
 
 
