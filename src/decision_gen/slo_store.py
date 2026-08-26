@@ -42,6 +42,7 @@ class SLOStore:
         self._api = api
         self._watch_factory = watch_factory
         self._stop = threading.Event()
+        self._synced = threading.Event()    # set after first watch event of any kind
         self._thread = None
         self._started = False
 
@@ -73,11 +74,24 @@ class SLOStore:
             e = self._crs.get((namespace, service_id))
             return e["spec"] if e else None
 
+    def synced(self):
+        return self._synced.is_set()
+
+    def wait_synced(self, timeout):
+        """Block until the watch has delivered its first event, or `timeout`
+        seconds elapse. Returns True iff synced (False = hit the timeout).
+        Any event counts — BOOKMARK on an empty CR set is still contact with
+        the API server and is enough to know "the world I'm about to tick
+        over isn't just pre-watch emptiness"."""
+        return self._synced.wait(timeout)
+
     # ---------- watcher ----------
 
     def _get_api(self):
         if self._api is None:
+            t = time.monotonic()
             self._api = client.CustomObjectsApi()
+            log.info("k8s api init: CustomObjectsApi(slo) %.3fs", time.monotonic() - t)
         return self._api
 
     def _make_watch(self):
@@ -103,12 +117,20 @@ class SLOStore:
         """One watch session. Yields until the stream ends or errors."""
         api = self._get_api()
         w = self._make_watch()
+        t_first_event = time.monotonic()
+        n_events = 0
         try:
             for event in w.stream(
                 api.list_cluster_custom_object,
                 GROUP, VERSION, PLURAL,
+                # Ask for a BOOKMARK after the initial list — that's the
+                # canonical "list complete" signal we set `_synced` on.
+                allow_watch_bookmarks=True,
                 timeout_seconds=300,
             ):
+                if n_events == 0:
+                    log.info("slo_store first event: %.3fs", time.monotonic() - t_first_event)
+                n_events += 1
                 if self._stop.is_set():
                     break
                 self._apply(event)
@@ -121,6 +143,24 @@ class SLOStore:
     def _apply(self, event):
         etype = event.get("type") if isinstance(event, dict) else None
         obj = event.get("object") if isinstance(event, dict) else None
+        # `_synced` means the initial watch list has fully arrived. ADDED events
+        # during the list are still arriving — setting synced on the first one
+        # was the bug. Signal: BOOKMARK (canonical k8s ≥1.15 marker), or any
+        # non-ADDED type (MODIFIED/DELETED/ERROR can only fire after the list
+        # has been delivered → list is a subset of what we've already applied).
+        if etype == "BOOKMARK":
+            if not self._synced.is_set():
+                log.info("slo_store initial list complete (bookmark)")
+            self._synced.set()
+            return
+        if etype == "ERROR":
+            if not self._synced.is_set():
+                log.info("slo_store initial list ended (ERROR event; treating as synced)")
+            self._synced.set()
+        elif etype in ("MODIFIED", "DELETED") and not self._synced.is_set():
+            log.info("slo_store initial list ended (first %s event; treating as synced)", etype)
+            self._synced.set()
+
         if etype in ("ADDED", "MODIFIED"):
             if not isinstance(obj, dict):
                 return

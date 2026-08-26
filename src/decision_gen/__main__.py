@@ -67,7 +67,10 @@ def main():
     try:
         slo.start()             # bg CR watch thread
         controller.start()      # bg ticker thread
-        serve(port=port, snapshot=controller.snapshot)  # blocks
+        # ready gates /readyz (kube endpoints) and /decisions (direct hits)
+        # on "controller has attempted a real tick" — serving the boot
+        # placeholder as if it were data is the empty-decisions bug.
+        serve(port=port, snapshot=controller.snapshot, ready=controller.ready)
     finally:
         controller.stop()
         slo.stop()

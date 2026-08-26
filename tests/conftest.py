@@ -14,7 +14,10 @@ class FakeSLOStore:
     """Dict-backed SLO cache. Matches `slo_store.SLOStore.snapshot()`."""
 
     def __init__(self, specs=None):
+        import threading
         self._specs = dict(specs or {})
+        self._event = threading.Event()
+        self._event.set()           # default: watch already has data
 
     def snapshot(self):
         return dict(self._specs)
@@ -24,6 +27,18 @@ class FakeSLOStore:
 
     def delete(self, namespace, service_id):
         self._specs.pop((namespace, service_id), None)
+
+    def mark_unsynced(self):
+        self._event.clear()
+
+    def mark_synced(self):
+        self._event.set()
+
+    def synced(self):
+        return self._event.is_set()
+
+    def wait_synced(self, timeout):
+        return self._event.wait(timeout)
 
 
 class FakeSignals:

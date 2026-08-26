@@ -99,6 +99,76 @@ def test_pool_capacity_failure_holds_previous_snapshot(
     assert _decisions(ctl) == {"svc": 2}
 
 
+def test_not_ready_until_first_tick(
+    fake_slo, fake_k8s, fake_signals, clock, cr_spec,
+):
+    """Server 503s until controller.ready() flips; it flips after the
+    first tick regardless of success. Bug the log at 04:49 exposed:
+    /decisions served a boot-empty payload as if it were data."""
+    _boot(fake_k8s, fake_signals)
+    ctl = _mk_ctl(fake_slo, fake_k8s, fake_signals, clock, cr_spec)
+    assert ctl.ready() is False
+    ctl.tick()
+    assert ctl.ready() is True
+
+
+def test_ready_flips_even_on_tick_failure(
+    fake_slo, fake_k8s, fake_signals, clock, cr_spec,
+):
+    """Posture matches the loop: a failed first tick means 'serve the
+    (still-empty) previous snapshot', not 'stay unready forever'."""
+    _boot(fake_k8s, fake_signals)
+    ctl = _mk_ctl(fake_slo, fake_k8s, fake_signals, clock, cr_spec)
+
+    class Boom:
+        def pool_capacity(self):
+            raise RuntimeError("k8s down")
+    ctl.k8s = Boom()
+    with pytest.raises(RuntimeError):
+        ctl.tick()
+    assert ctl.ready() is True
+
+
+def test_loop_first_tick_waits_for_slo_sync(fake_slo, fake_k8s, fake_signals, clock, cr_spec):
+    """Race regression: `_loop` must not tick off an empty pre-watch cache."""
+    import threading, time as pytime
+
+    fake_slo.mark_unsynced()
+    _boot(fake_k8s, fake_signals)
+    ctl = _mk_ctl(fake_slo, fake_k8s, fake_signals, clock, cr_spec)
+    ctl.tick_seconds = 0.05
+
+    t = threading.Thread(target=ctl._loop, daemon=True)
+    t.start()
+    pytime.sleep(0.2)
+    assert _decisions(ctl) == {}
+
+    fake_slo.mark_synced()
+    deadline = pytime.time() + 2
+    while pytime.time() < deadline and _decisions(ctl) == {}:
+        pytime.sleep(0.02)
+    ctl.stop()
+    t.join(timeout=2)
+    assert _decisions(ctl) == {"svc": 2}
+
+
+def test_loop_first_tick_proceeds_when_already_synced(fake_slo, fake_k8s, fake_signals, clock, cr_spec):
+    """Baseline: with synced=True from the start, the first tick doesn't block."""
+    import threading, time as pytime
+    _boot(fake_k8s, fake_signals)
+    ctl = _mk_ctl(fake_slo, fake_k8s, fake_signals, clock, cr_spec)
+    ctl.tick_seconds = 0.05
+
+    t = threading.Thread(target=ctl._loop, daemon=True)
+    t.start()
+    deadline = pytime.time() + 2
+    while pytime.time() < deadline and _decisions(ctl) == {}:
+        pytime.sleep(0.02)
+    ctl.stop()
+    t.join(timeout=2)
+    assert _decisions(ctl) == {"svc": 2}
+
+
 def test_one_tick_transition_log_is_legible(
     fake_slo, fake_k8s, fake_signals, clock, cr_spec, caplog,
 ):

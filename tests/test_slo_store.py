@@ -60,6 +60,88 @@ def _wait_for(pred, timeout_s=2.0):
 
 # ---------- tests ----------
 
+def test_synced_set_on_bookmark():
+    """Canonical sync signal. Watch streams ADDED, ADDED, ..., BOOKMARK.
+    Sync must not fire until the bookmark: the bug this test guards is
+    'first tick sees only 1 of N CRs because the watch was mid-list'."""
+    w = FakeWatch([[
+        _cr_event("ADDED", "kimi", "kimi-k25"),
+        _cr_event("ADDED", "modelforge", "fallback-modelforge-01"),
+        {"type": "BOOKMARK", "object": {}},
+    ]])
+    store = SLOStore(api=MagicMock(), watch_factory=lambda: w)
+    assert not store.synced()
+    store.start()
+    try:
+        assert _wait_for(store.synced)
+        # Both CRs must be visible when synced fires.
+        assert len(store.snapshot()) == 2
+        assert store.wait_synced(timeout=0) is True
+    finally:
+        store.stop()
+
+
+def test_not_synced_until_bookmark():
+    """Specifically: first ADDED alone doesn't sync. The race this test
+    pins produced `tick start: 1 CRs` instead of 2."""
+
+    class BlockingWatch:
+        """Yields the first ADDED, then blocks until the test releases it,
+        then yields the rest."""
+        def __init__(self):
+            self.release = threading.Event()
+
+        def stream(self, *a, **kw):
+            yield _cr_event("ADDED", "kimi", "kimi-k25")
+            self.release.wait(2)
+            yield _cr_event("ADDED", "modelforge", "fallback-modelforge-01")
+            yield {"type": "BOOKMARK", "object": {}}
+
+        def stop(self):
+            self.release.set()   # unblock so the thread can exit
+
+    w = BlockingWatch()
+    store = SLOStore(api=MagicMock(), watch_factory=lambda: w)
+    store.start()
+    try:
+        assert _wait_for(lambda: len(store.snapshot()) == 1)
+        assert not store.synced(), "synced too early — first ADDED set it"
+        w.release.set()
+        assert _wait_for(store.synced)
+        assert len(store.snapshot()) == 2
+    finally:
+        store.stop()
+
+
+def test_synced_set_on_bookmark_no_crs():
+    """Empty CR set: just BOOKMARK. Watch has still synced — 'no CRs exist'
+    is no longer ambiguous with 'haven't seen the list yet'."""
+    w = FakeWatch([[{"type": "BOOKMARK", "object": {}}]])
+    store = SLOStore(api=MagicMock(), watch_factory=lambda: w)
+    assert not store.synced()
+    store.start()
+    try:
+        assert _wait_for(store.synced)
+        assert store.snapshot() == {}
+    finally:
+        store.stop()
+
+
+def test_synced_on_modified_without_bookmark():
+    """Graceful fallback for servers that don't honor allow_watch_bookmarks:
+    a non-ADDED event necessarily means the initial list has ended."""
+    w = FakeWatch([[
+        _cr_event("ADDED", "kimi", "kimi-k25"),
+        _cr_event("MODIFIED", "kimi", "kimi-k25", rv=2),
+    ]])
+    store = SLOStore(api=MagicMock(), watch_factory=lambda: w)
+    store.start()
+    try:
+        assert _wait_for(store.synced)
+    finally:
+        store.stop()
+
+
 def test_added_then_snapshot():
     w = FakeWatch([[
         _cr_event("ADDED", "kimi", "kimi-k25"),

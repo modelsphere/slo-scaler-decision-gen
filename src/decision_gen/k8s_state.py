@@ -12,6 +12,7 @@ limits; find pool affinity" so the downstream code is uniform.
 """
 
 import logging
+import time
 from dataclasses import dataclass
 
 from kubernetes import client
@@ -69,17 +70,23 @@ class K8sState:
 
     def _apps_api(self):
         if self._apps is None:
+            t = time.monotonic()
             self._apps = client.AppsV1Api()
+            log.info("k8s api init: AppsV1Api %.3fs", time.monotonic() - t)
         return self._apps
 
     def _core_api(self):
         if self._core is None:
+            t = time.monotonic()
             self._core = client.CoreV1Api()
+            log.info("k8s api init: CoreV1Api %.3fs", time.monotonic() - t)
         return self._core
 
     def _custom_api(self):
         if self._custom is None:
+            t = time.monotonic()
             self._custom = client.CustomObjectsApi()
+            log.info("k8s api init: CustomObjectsApi %.3fs", time.monotonic() - t)
         return self._custom
 
     # ---------- resolve_placement ----------
@@ -96,7 +103,7 @@ class K8sState:
         if lws is not None:
             placement = self._placement_from_lws(namespace, target_name, lws)
             if placement is not None:
-                log.debug("%s/%s: lws pool=%s gpr=%d spec_replicas=%d",
+                log.info("%s/%s: lws pool=%s gpr=%d spec_replicas=%d",
                           namespace, service_id, placement.pool,
                           placement.gpus_per_replica, placement.spec_replicas)
                 return placement
@@ -119,7 +126,7 @@ class K8sState:
                 spec_replicas=int(sts_spec.get("replicas", 1)),
             )
             if placement is not None:
-                log.debug("%s/%s: sts pool=%s gpr=%d spec_replicas=%d",
+                log.info("%s/%s: sts pool=%s gpr=%d spec_replicas=%d",
                           namespace, service_id, placement.pool,
                           placement.gpus_per_replica, placement.spec_replicas)
                 return placement
@@ -139,7 +146,7 @@ class K8sState:
                 spec_replicas=int(deploy_spec.get("replicas", 0)),
             )
             if placement is not None:
-                log.debug("%s/%s: deploy pool=%s gpr=%d spec_replicas=%d",
+                log.info("%s/%s: deploy pool=%s gpr=%d spec_replicas=%d",
                           namespace, service_id, placement.pool,
                           placement.gpus_per_replica, placement.spec_replicas)
                 return placement
@@ -149,7 +156,7 @@ class K8sState:
             )
             return None
 
-        log.debug("no workload found for %s/%s", namespace, service_id)
+        log.info("no workload found for %s/%s", namespace, service_id)
         return None
 
     def _try_get_lws(self, namespace, name):
@@ -296,7 +303,9 @@ class K8sState:
         so we do too. Cordoned and NotReady nodes contribute zero.
         """
         core = self._core_api()
+        t = time.monotonic()
         nodes = core.list_node().items or []
+        log.info("k8s list_node: %.3fs, %d nodes", time.monotonic() - t, len(nodes))
 
         pools = {}
         for n in nodes:
@@ -317,9 +326,6 @@ class K8sState:
             except (TypeError, ValueError):
                 gpus = 0
             pools[product] = pools.get(product, 0) + gpus
-        if pools:
-            summary = ", ".join(f"{p}={n}" for p, n in sorted(pools.items()))
-            log.info("pool_capacity: %s", summary)
-        else:
+        if not pools:
             log.warning("pool_capacity: no GPU nodes found")
         return pools

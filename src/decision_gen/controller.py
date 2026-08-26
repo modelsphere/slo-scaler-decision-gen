@@ -60,6 +60,7 @@ class Controller:
         self._snapshot = wire.to_wire({})
         self._views = {}        # (ns, svc) → ServiceView
         self._stop = threading.Event()
+        self._has_ticked = threading.Event()    # set after first tick attempt
         self._thread = None
 
     # ---------- lifecycle ----------
@@ -82,9 +83,27 @@ class Controller:
                 "decisions": list(self._snapshot["decisions"]),
             }
 
+    def ready(self):
+        """True only after the controller has attempted at least one tick.
+
+        Between process start and the first tick there's nothing meaningful
+        to serve — the snapshot is the empty placeholder. Serving that as a
+        real answer is the bug 04:49 <log line> exposed: an early consumer
+        sees decisions=[] and concludes no services are managed."""
+        return self._has_ticked.is_set()
+
     # ---------- loop ----------
 
     def _loop(self):
+        # First tick must not run off an empty slo cache. Wait (bounded) for
+        # the watch to report contact with the API server; on timeout tick
+        # anyway — same fail-open posture as "serve previous snapshot" errors.
+        t = time.monotonic()
+        if self.slo.wait_synced(timeout=10):
+            log.info("controller: slo synced in %.3fs; first tick",
+                     time.monotonic() - t)
+        else:
+            log.warning("controller: slo not synced after 10s; first tick anyway")
         while not self._stop.is_set():
             started = time.time()
             try:
@@ -97,8 +116,15 @@ class Controller:
     # ---------- tick ----------
 
     def tick(self):
+        t0 = time.monotonic()
         now = self.clock()
+        # Set on attempt as well as success: "serving previous snapshot"
+        # posture is identical whether the previous was real data or the
+        # boot placeholder, so readiness shouldn't distinguish them either.
+        self._has_ticked.set()
         crs = self.slo.snapshot()
+        log.info("tick start: slo.snapshot %+0.3fs (%d CRs)",
+                 time.monotonic() - t0, len(crs))
 
         # 1. Free ledger entries for deleted CRs BEFORE gap computation.
         for key in list(self._views):
@@ -112,8 +138,10 @@ class Controller:
             return
 
         # 2. Pool capacity. Failure aborts the whole tick.
+        t = time.monotonic()
         capacity = self.k8s.pool_capacity()
-        log.debug("pool capacity: %s", capacity)
+        log.info("pool capacity: %s (%+0.3fs into tick)",
+                 capacity, time.monotonic() - t0)
 
         # 3. Per-service step → est / want.
         transitions = []
@@ -161,7 +189,7 @@ class Controller:
         for key, n in booked.items():
             pool, gpr = placements[key]
             gap[pool] = gap.get(pool, 0) - n * gpr
-        log.debug("pool gap after booking: %s", gap)
+        log.info("pool gap after booking: %s", gap)
 
         # 5. Planner arbiters capacity. Output is final (R8).
         alloc = planner.resolve(
@@ -175,7 +203,7 @@ class Controller:
             views[key].commit(n, now, cause="planner")
 
         for t in transitions:
-            log.debug("tick %s/%s %s", t.ns, t.service, _fmt_transition(t))
+            log.info("tick %s/%s %s", t.ns, t.service, _fmt_transition(t))
 
         committed = {key: v.committed for key, v in views.items()}
         with self._lock:

@@ -1,7 +1,9 @@
-"""Smoke test: server.py serves /healthz, /readyz, /decisions from a snapshot."""
+"""Smoke test: server.py serves /healthz, /readyz, /decisions from a snapshot,
+and 503s /readyz + /decisions when the controller hasn't ticked yet."""
 
 import json
 import threading
+import urllib.error
 import urllib.request
 
 from decision_gen import server
@@ -14,10 +16,11 @@ def _find_free_port():
         return s.getsockname()[1]
 
 
-def _start(snapshot):
+def _start(snapshot, ready=True):
     port = _find_free_port()
     httpd = server.ThreadingHTTPServer(
-        ("127.0.0.1", port), server.make_handler(lambda: snapshot)
+        ("127.0.0.1", port),
+        server.make_handler(lambda: snapshot, lambda: ready),
     )
     t = threading.Thread(target=httpd.serve_forever, daemon=True)
     t.start()
@@ -25,8 +28,11 @@ def _start(snapshot):
 
 
 def _get(port, path):
-    with urllib.request.urlopen(f"http://127.0.0.1:{port}{path}", timeout=5) as resp:
-        return resp.status, json.loads(resp.read())
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}{path}", timeout=5) as resp:
+            return resp.status, json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        return e.code, json.loads(e.read())
 
 
 def test_health_and_decisions_on_empty_snapshot():
@@ -39,6 +45,28 @@ def test_health_and_decisions_on_empty_snapshot():
         assert status == 200
         assert body["apiVersion"] == "llmscaling.inference.x-k8s.io/v1alpha1"
         assert body["decisions"] == []
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_not_ready_503s_readyz_and_decisions():
+    """Pre-first-tick, the empty boot snapshot must not be presented as data.
+    /healthz stays up so the kubelet doesn't kill a slow-starting pod."""
+    snapshot = {"apiVersion": "llmscaling.inference.x-k8s.io/v1alpha1", "decisions": []}
+    httpd, port = _start(snapshot, ready=False)
+    try:
+        s, body = _get(port, "/healthz")
+        assert s == 200 and body == {"status": "ok"}
+
+        s, body = _get(port, "/readyz")
+        assert s == 503 and body["status"] == "not_ready"
+
+        s, body = _get(port, "/decisions")
+        assert s == 503 and body["status"] == "not_ready"
+
+        s, body = _get(port, "/decisions?serviceId=foo")
+        assert s == 503 and body["status"] == "not_ready"
     finally:
         httpd.shutdown()
         httpd.server_close()

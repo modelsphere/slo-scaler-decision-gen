@@ -13,7 +13,27 @@ see commit history for curl transcripts):
     units by declaration.
   - No label filters beyond `service=` (I1/C11). In particular, never
     `stream="true"` — live exporters omit that label entirely for
-    some services. `sum by(le)` aggregates past whatever labels exist.
+    some services.
+  - TTFT / OTPS quantiles read the NATIVE histogram form of the series
+    (`histogram_quantile(q, sum(rate(series{...}[5m])))`), not classic
+    `_bucket` + `by(le)`. Classic buckets cap at le=10s / le=400 tok/s —
+    exactly the overload region where the reading matters most — and
+    overestimate by ~30-40% at p80 (measured live 2026-08-26: TTFT
+    classic 0.77s vs native 0.54s; OTPS classic 320 vs native 249 t/s).
+    `avg` still uses `_sum` / `_count` (exposed identically by both forms).
+  - OTPS quantile inversion: the metric is a FLOOR — CR 'p80' means
+    "80% of requests must exceed the threshold speed", i.e. violated by
+    the SLOW tail. On a tokens/sec histogram that is quantile 1−0.8=0.2,
+    not 0.8 (p80 of tok/s is the fast head). TTFT is a CEILING and uses
+    the quantile as declared.
+  - `replicas_ready` uses `max by(service)(avg_over_time(raw[2m]))`:
+    the `avg_over_time(2m)` smooths over scrape gaps — observed live
+    2026-08-26: instant vector of one service vanished entirely during
+    drain while 2m-avg still returned a value, so a missing instant
+    doesn't knock `physical` to None and lose IN_DRAIN detection.
+    `max by(service)` then collapses pod/instance/route so a second
+    exporter pod (HA or rolling restart) can't produce >1 row, which
+    this client treats as missing_series.
   - 5m rate windows for TTFT / OTPS sums and histograms (halves
     tick-to-tick variance without making rule-1 sluggish at our 60s
     tick); 2m for rejection.
@@ -72,7 +92,7 @@ class Signals:
             log.warning("prom bad json | %s%s: %s", tag, promql, e)
             return Reading(None, "missing_series")
         if not rows:
-            log.debug("prom 0 rows | %s%s", tag, promql)
+            log.info("prom 0 rows | %s%s", tag, promql)
             return Reading(None, "missing_series")
         if len(rows) > 1:
             log.warning("prom >1 row | %s%s (%d rows)", tag, promql, len(rows))
@@ -84,9 +104,9 @@ class Signals:
             return Reading(None, "missing_series")
 
         if math.isnan(v):
-            log.debug("prom %s→ NaN (no traffic) | %s", tag, promql)
+            log.info("prom %s→ NaN (no traffic) | %s", tag, promql)
             return Reading(None, "no_traffic")
-        log.debug("prom %s→ %g | %s", tag, v, promql)
+        log.info("prom %s→ %g | %s", tag, v, promql)
         return Reading(v, "ok")
 
     # ---------- signal templates ----------
@@ -95,7 +115,7 @@ class Signals:
     def _svc(namespace, service_id):
         return f"{namespace}/{service_id}"
 
-    def _histogram(self, series, namespace, service_id, kind):
+    def _histogram(self, series, namespace, service_id, kind, invert=False):
         svc = self._svc(namespace, service_id)
         if kind == "avg":
             return (
@@ -104,22 +124,29 @@ class Signals:
                 f'sum(rate({series}_count{{service="{svc}"}}[5m]))'
             )
         q = _QUANTILES[kind]
+        if invert:
+            q = 1.0 - q
+        # Native histogram: no _bucket suffix, no `by(le)` — bucketless
+        # form, no le-cap distortion. See module docstring.
         return (
             f'histogram_quantile({q}, '
-            f'sum by(le)(rate({series}_bucket{{service="{svc}"}}[5m])))'
+            f'sum(rate({series}{{service="{svc}"}}[5m])))'
         )
 
     def ttft(self, namespace, service_id, kind):
-        """TTFT in seconds. kind: 'avg' | 'p50' | 'p80' | ... | 'p99'."""
+        """TTFT in seconds (ceiling). kind: 'avg' | 'p50' | ... | 'p99'."""
         return self._query(
             self._histogram("bodylog_ttft_seconds", namespace, service_id, kind),
             label=f"ttft.{kind}",
         )
 
     def otps(self, namespace, service_id, kind):
-        """OTPS in tokens/sec/request. Same return contract as ttft."""
+        """OTPS in tokens/sec/request (floor). A CR 'pN' declares N% of
+        requests must beat the threshold — the slow tail — so the native
+        quantile is inverted: p80 → 0.2. 'avg' is unaffected."""
         return self._query(
-            self._histogram("bodylog_output_tok_per_second", namespace, service_id, kind),
+            self._histogram("bodylog_output_tok_per_second", namespace, service_id, kind,
+                            invert=True),
             label=f"otps.{kind}",
         )
 
@@ -136,10 +163,16 @@ class Signals:
     def replicas_ready(self, namespace, service_id):
         """Physical ready replicas (bodylog_service_replicas_ready).
 
-        Fractional values from HA exporters are rounded (C15)."""
+        `avg_over_time(2m)` smooths over single-scrape gaps (an instant
+        vector can vanish for one 30s scrape during exporter restarts,
+        and None here turns off IN_DRAIN detection in direction.phase_of).
+        `max by(service)` then collapses pod/instance/route so HA or
+        rolling restarts of the exporter can't produce >1 series. Values
+        are rounded after the collapse (C15)."""
         svc = self._svc(namespace, service_id)
         r = self._query(
-            f'bodylog_service_replicas_ready{{service="{svc}"}}',
+            f'max by(service)(avg_over_time('
+            f'bodylog_service_replicas_ready{{service="{svc}"}}[2m]))',
             label="replicas",
         )
         if r.state != "ok":
