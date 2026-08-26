@@ -10,6 +10,7 @@ from decision_gen.k8s_state import K8sState, Placement
 
 
 POOL_H100 = "NVIDIA-H100-80GB-HBM3"
+POOL_H800 = "NVIDIA-H800"
 POOL_A100 = "NVIDIA-A100-SXM4-80GB"
 
 
@@ -356,3 +357,82 @@ def test_pool_capacity_no_pods_call():
     state = K8sState(apps_v1=apps, core_v1=core, custom_v1=custom)
     state.pool_capacity()
     core.list_pod_for_all_namespaces.assert_not_called()
+
+
+# ---------- TEMP-REVERT: H800-as-H100 pool merge ----------
+# Pins for the alias. On revert, delete this whole block and POOL_ALIASES.
+# The intended-future failure is that polymorphic placement makes the
+# merge redundant; until then these are load-bearing.
+
+def _affinity_multi_pool(pools):
+    return {
+        "nodeAffinity": {
+            "requiredDuringSchedulingIgnoredDuringExecution": {
+                "nodeSelectorTerms": [{
+                    "matchExpressions": [{
+                        "key": "nvidia.com/gpu.product",
+                        "operator": "In",
+                        "values": pools,
+                    }],
+                }],
+            },
+        },
+    }
+
+
+def test_h800_only_affinity_maps_to_h100():
+    deploy = {"spec": {"template": {"spec": {
+        "affinity": _affinity_multi_pool([POOL_H800]),
+        "containers": [{"name": "m", "resources": {"limits": {"nvidia.com/gpu": 2}}}],
+    }}}}
+    apps, core, custom = _fake_apis(deploy=deploy)
+    state = K8sState(apps_v1=apps, core_v1=core, custom_v1=custom)
+    p = state.resolve_placement("ns", "svc")
+    assert p is not None and p.pool == POOL_H100
+
+
+def test_h100_h800_mixed_affinity_maps_to_h100():
+    deploy = {"spec": {"template": {"spec": {
+        "affinity": _affinity_multi_pool([POOL_H100, POOL_H800]),
+        "containers": [{"name": "m", "resources": {"limits": {"nvidia.com/gpu": 2}}}],
+    }}}}
+    apps, core, custom = _fake_apis(deploy=deploy)
+    state = K8sState(apps_v1=apps, core_v1=core, custom_v1=custom)
+    p = state.resolve_placement("ns", "svc")
+    assert p is not None and p.pool == POOL_H100
+
+
+def test_h100_a100_mixed_affinity_still_unmanageable():
+    """Alias must not paper over genuine ambiguity — {H100, A100} is a real
+    cross-pool conflict and must stay unmanageable (fail closed)."""
+    deploy = {"spec": {"template": {"spec": {
+        "affinity": _affinity_multi_pool([POOL_H100, POOL_A100]),
+        "containers": [{"name": "m", "resources": {"limits": {"nvidia.com/gpu": 2}}}],
+    }}}}
+    apps, core, custom = _fake_apis(deploy=deploy)
+    state = K8sState(apps_v1=apps, core_v1=core, custom_v1=custom)
+    assert state.resolve_placement("ns", "svc") is None
+
+
+def test_a100_only_affinity_untouched_by_alias():
+    deploy = {"spec": {"template": _pod_template(gpu_limit=2, pool=POOL_A100)}}
+    apps, core, custom = _fake_apis(deploy=deploy)
+    state = K8sState(apps_v1=apps, core_v1=core, custom_v1=custom)
+    p = state.resolve_placement("ns", "svc")
+    assert p is not None and p.pool == POOL_A100
+
+
+def test_pool_capacity_merges_h800_into_h100():
+    apps, core, custom = _fake_apis(
+        nodes=[
+            _node("h100-1", POOL_H100, 8),
+            _node("h100-2", POOL_H100, 8),
+            _node("h800-1", POOL_H800, 8),
+            _node("a100-1", POOL_A100, 4),
+        ],
+    )
+    state = K8sState(apps_v1=apps, core_v1=core, custom_v1=custom)
+    cap = state.pool_capacity()
+    assert cap[POOL_H100] == 24     # 16 h100 + 8 h800
+    assert POOL_H800 not in cap
+    assert cap[POOL_A100] == 4

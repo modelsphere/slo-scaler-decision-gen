@@ -29,6 +29,21 @@ GPU_LIMIT_KEY = "nvidia.com/gpu"
 GPU_PRODUCT_LABEL = "nvidia.com/gpu.product"
 GPU_PRESENT_LABEL = "nvidia.com/gpu.present"
 
+# TEMP-REVERT — H800-as-H100 pool merge. To revoke: delete POOL_ALIASES
+# and the `_canonical_pool()` indirection below (revert to direct product
+# lookups). Real fix is polymorphic pool placement, an R10 contract change;
+# filed against scaling-requirements R10. Workloads pinned to H800-only
+# get re-pooled into H100 by this alias — acceptable iff H800-compat
+# workloads may also schedule on H100. See commit that introduced this.
+POOL_ALIASES = {
+    "NVIDIA-H800": "NVIDIA-H100-80GB-HBM3",
+}
+
+
+def _canonical_pool(product):
+    """TEMP-REVERT — see POOL_ALIASES above."""
+    return POOL_ALIASES.get(product, product)
+
 
 @dataclass(frozen=True)
 class Placement:
@@ -283,9 +298,16 @@ class K8sState:
             for me in mes:
                 if me.get("key") == GPU_PRODUCT_LABEL and me.get("operator") == "In":
                     values.extend(me.get("values") or [])
+        # TEMP-REVERT — map each candidate product through POOL_ALIASES
+        # so {H100}, {H800}, and {H100, H800} all collapse to a single
+        # canonical pool. To revoke: drop the _canonical_pool wrapper,
+        # restore `if len(values) == 1: return values[0]`.
         values = sorted(set(values))
-        if len(values) == 1:
-            return values[0]
+        if not values:
+            return None
+        canonical = {_canonical_pool(v) for v in values}
+        if len(canonical) == 1:
+            return canonical.pop()
         return None
 
     # ---------- pool_capacity ----------
@@ -325,7 +347,10 @@ class K8sState:
                 gpus = int(alloc.get(GPU_LIMIT_KEY, 0))
             except (TypeError, ValueError):
                 gpus = 0
-            pools[product] = pools.get(product, 0) + gpus
+            # TEMP-REVERT — fold aliased products (H800) into their
+            # canonical pool so `pools` has a single entry for the
+            # merged hardware class. To revoke: use `product` directly.
+            pools[_canonical_pool(product)] = pools.get(_canonical_pool(product), 0) + gpus
         if not pools:
             log.warning("pool_capacity: no GPU nodes found")
         return pools
