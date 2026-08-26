@@ -160,6 +160,25 @@ class Signals:
             label="rej",
         )
 
+    def rejection_count_2m(self, namespace, service_id):
+        """429 sample size over 2m. R1a evidence floor: a 100% rate off
+        N=1 must not invoke emergency scale-up; need ≥5 rejections."""
+        svc = self._svc(namespace, service_id)
+        return self._query(
+            f'sum(increase(openresty_rejected_total{{service="{svc}"}}[2m]))',
+            label="rej.count",
+        )
+
+    def request_count_5m(self, namespace, service_id):
+        """Request sample size over 5m — matches the TTFT/OTPS evaluation
+        window. R1b evidence floor: verdict off tiny N is noise; need ≥20
+        requests in the same window."""
+        svc = self._svc(namespace, service_id)
+        return self._query(
+            f'sum(increase(bodylog_requests_total{{service="{svc}",backend!="(none)"}}[5m]))',
+            label="req.count",
+        )
+
     def replicas_ready(self, namespace, service_id):
         """Physical ready replicas (bodylog_service_replicas_ready).
 

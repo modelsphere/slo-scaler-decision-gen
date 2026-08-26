@@ -60,6 +60,7 @@ Transition = namedtuple("Transition", [
     "est",
     "want",
     "hold_reason",         # '' on propose, else e.g. 'hold-cooldown-up 1200s<1800s'
+    "skip",                # bool — controller must not touch this service this tick
 ])
 
 
@@ -132,9 +133,33 @@ class ServiceView:
 
         readings: {'ttft': {kind: Reading}, 'otps': {kind: Reading},
                    'rejection': Reading}
-        physical: int | None — or None when replicas_ready is missing
-                  (§5 magnitude fallback).
+        physical: int | None — replicas_ready; None or 0 = no-stats, skip.
+
+        physical ∈ {None, 0} → no-op tick. We can't trust any SLO /
+        rejection signal derived from zero backends, and seeding or
+        re-stamping clocks off dead-air data has burned us. Returns a
+        Transition with skip=True; controller excludes the service from
+        the planner this tick. State (committed, clocks, comfort streak)
+        is frozen until a real reading arrives.
         """
+        if physical is None or physical == 0:
+            return Transition(
+                ns=self.ns, service=self.service,
+                pool=placement.pool, gpr=placement.gpus_per_replica,
+                kind=placement.kind, spec_replicas=placement.spec_replicas,
+                readings=readings, verdicts={"ttft": {}, "otps": {}},
+                physical=physical,
+                gates=triggers.Gates(up_cooldown_open=False, shed_ready=False),
+                since_change_s=int(now - self.last_change_at),
+                comfort_s=(None if self.comfortable_since is None
+                           else int(now - self.comfortable_since)),
+                phase=direction.Phase.SETTLED,
+                proposal=None,
+                est=self.committed if self.committed is not None else 0,
+                want=self.committed if self.committed is not None else 0,
+                hold_reason=f"hold-no-physical-data physical={physical}",
+                skip=True,
+            )
         self._ensure_seeded(cr_spec, placement, now)
         mn, mx, _pri = _bounds(cr_spec)
 
@@ -146,26 +171,33 @@ class ServiceView:
             self.commit(mx, now, cause="cr-max-shrink")
 
         # ---- verdicts ----
+        # `no_traffic` (histogram_quantile NaN = zero requests in window)
+        # contributes COMFORTABLE, not missing: zero demand IS the deepest
+        # possible comfort. `missing_series` (query 0-rows / bad shape /
+        # transport error) continues to mean "no evidence; hold".
         verdicts = {"ttft": {}, "otps": {}}
         missing_slo = []
         for signal in ("ttft", "otps"):
             for kind, r in (readings.get(signal) or {}).items():
-                if r.state != "ok":
+                if r.state == "ok":
+                    thr = _threshold(cr_spec, signal, kind)
+                    verdicts[signal][kind] = classify(
+                        METRIC_DIRECTION[signal], r.value, thr, SLO_HEADROOM,
+                    )
+                elif r.state == "no_traffic":
+                    verdicts[signal][kind] = Verdict.COMFORTABLE
+                else:   # missing_series / unknown
                     missing_slo.append(f"{signal}.{kind}:{r.state}")
                     verdicts[signal][kind] = None
-                    continue
-                thr = _threshold(cr_spec, signal, kind)
-                verdicts[signal][kind] = classify(
-                    METRIC_DIRECTION[signal], r.value, thr, SLO_HEADROOM,
-                )
 
         rej = readings.get("rejection")
         rej_value = rej.value if rej is not None and rej.state == "ok" else None
 
         # ---- comfort streak (R4) ----
-        # Reset events: commit (inside commit()), any missing signal
-        # (here), any verdict leaving COMFORTABLE, any violation (these
-        # last two covered by the all-COMFORTABLE check).
+        # Reset events: commit (inside commit()), any MISSING-series signal,
+        # any verdict leaving COMFORTABLE, any violation. `no_traffic` is
+        # NOT a reset — it feeds COMFORTABLE above, so an idle service's
+        # comfort streak accumulates and it sheds after the down-cooldown.
         flat = [v for sig in verdicts.values() for v in sig.values()]
         any_missing = missing_slo or (rej is not None and rej.state != "ok")
         all_comfy = (not any_missing
@@ -207,7 +239,19 @@ class ServiceView:
             for sig, by_kind in verdicts.items()
             for kind, v in by_kind.items()
         }
-        proposal = triggers.evaluate(flat_verdicts, rej_value, current, gates)
+        # Evidence floors for R1a/R1b come in as sample counts.
+        rej_count_reading = readings.get("rejection_count")
+        req_count_reading = readings.get("request_count")
+        rej_count = (rej_count_reading.value
+                     if rej_count_reading is not None and rej_count_reading.state == "ok"
+                     else None)
+        req_count = (req_count_reading.value
+                     if req_count_reading is not None and req_count_reading.state == "ok"
+                     else None)
+        proposal = triggers.evaluate(
+            flat_verdicts, rej_value, current, gates,
+            rejection_count=rej_count, request_count=req_count,
+        )
 
         # ---- est stage: post-clamp (R9) ----
         if proposal is None:
@@ -247,6 +291,7 @@ class ServiceView:
             comfort_s=None if comfort_s is None else int(comfort_s),
             phase=phase, proposal=proposal,
             est=est, want=want, hold_reason=hold_reason,
+            skip=False,
         )
 
 

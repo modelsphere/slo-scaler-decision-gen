@@ -28,48 +28,52 @@ def _comfy(n=2):
 
 # ---------- R1a fire_alarm ----------
 
+# Tests below pass rejection_count=100 / request_count=100 to stay above
+# the evidence floors introduced in 2026-08; those floors have their own
+# boundary tests below and don't belong in the sizing-related cases.
+
 def test_r1a_fires_at_threshold():
-    p = fire_alarm(0.05, current=10)
+    p = fire_alarm(0.05, current=10, rejection_count=100)
     assert p is not None
     assert p.rule == "r1a-fire"
 
 
 def test_r1a_silent_below_threshold():
-    assert fire_alarm(0.049, current=10) is None
-    assert fire_alarm(0.0, current=10) is None
-    assert fire_alarm(None, current=10) is None
+    assert fire_alarm(0.049, current=10, rejection_count=100) is None
+    assert fire_alarm(0.0, current=10, rejection_count=100) is None
+    assert fire_alarm(None, current=10, rejection_count=100) is None
 
 
 def test_r1a_sizes_to_deficit():
     # r=0.0526 ≈ 1/19. deficit = 0.0526/(1-0.0526) ≈ 0.0555.
     # mult = 1 + 0.0555 × 2.0 = 1.111; ceil(10 × 1.111) = 12.
-    p = fire_alarm(0.0526, current=10)
+    p = fire_alarm(0.0526, current=10, rejection_count=100)
     assert p.replicas == 12
 
 
 def test_r1a_cap_limits_huge_rejection():
     # Huge r → mult capped at 1.5.
-    p = fire_alarm(0.9, current=10)
+    p = fire_alarm(0.9, current=10, rejection_count=100)
     assert p.replicas == 15
 
 
 def test_r1a_never_below_current_plus_one():
     # Tiny but above-threshold rejection; ceil(current × mult) may not
     # exceed current. Floor is current+1.
-    p = fire_alarm(0.05, current=100)
+    p = fire_alarm(0.05, current=100, rejection_count=100)
     assert p.replicas >= 101
 
 
 def test_r1a_zero_base_scales_to_one(C1=None):
     # C1 / C5: current=0 must not pin.
-    p = fire_alarm(0.1, current=0)
+    p = fire_alarm(0.1, current=0, rejection_count=100)
     assert p.replicas >= 1
 
 
 def test_r1a_at_rejection_1():
     """15:00:42 incident: r=1.0 divided by zero, crashed the whole tick.
     Clip at r=0.99 keeps the deficit finite; mult caps at 1.5."""
-    p = fire_alarm(1.0, current=4)
+    p = fire_alarm(1.0, current=4, rejection_count=100)
     assert p is not None
     assert p.replicas == max(4 + 1, int(4 * 1.5 + 0.999))   # 6
 
@@ -77,7 +81,7 @@ def test_r1a_at_rejection_1():
 def test_r1a_at_rejection_above_1_clipped():
     """Buggy exporter / formula drift could give r > 1.0 — clip to 0.99,
     treat as max emergency rather than crash or inversion."""
-    p = fire_alarm(1.5, current=4)
+    p = fire_alarm(1.5, current=4, rejection_count=100)
     assert p is not None
     assert p.replicas == 6
 
@@ -86,15 +90,37 @@ def test_r1a_at_rejection_0_99_hits_cap():
     """Boundary regression: at r=0.99, deficit=99; mult = 1+99*2 = 199;
     cap must reduce to 1.5. (Pinning that the cap engages, not just that
     nothing crashes.)"""
-    p = fire_alarm(0.99, current=4)
+    p = fire_alarm(0.99, current=4, rejection_count=100)
     assert p is not None
     assert p.replicas == 6   # ceil(4*1.5)=6 vs current+1=5
+
+
+def test_r1a_needs_min_rejections():
+    """Evidence floor: rate off tiny N is noise. At .rejection_count < 5
+    the rate can be 100% and we still don't fire — 1 rejected request is
+    not a capacity emergency. At exactly 5 we fire."""
+    # The wrong implementation would forget the floor. Test both sides.
+    assert fire_alarm(1.0, current=10, rejection_count=4) is None
+    assert fire_alarm(1.0, current=10, rejection_count=5) is not None
+    assert fire_alarm(0.5, current=10, rejection_count=0) is None
+    assert fire_alarm(0.5, current=10, rejection_count=100) is not None
+    # Missing count (None = prom missing_series) is also a no-fire.
+    assert fire_alarm(1.0, current=10, rejection_count=None) is None
+
+
+def test_r1a_pre_floor_default_was_fire():
+    """Backward compat: callers that don't pass a count behave as before
+    (None = treat as missing → no fire). Pinning the default DID change
+    semantics deliberately."""
+    assert fire_alarm(1.0, current=10) is None          # count=None
+    assert fire_alarm(1.0, current=10, rejection_count=5) is not None
 
 
 def test_r1a_ignores_gate_state():
     """Ungated by construction: fire_alarm takes no gates argument.
     This test pins that evaluate() checks it first even with gates closed."""
-    p = evaluate({}, rejection_rate=0.1, current=10, gates=GATES_CLOSED)
+    p = evaluate({}, rejection_rate=0.1, current=10, gates=GATES_CLOSED,
+                 rejection_count=100)
     assert p is not None and p.rule == "r1a-fire"
 
 
@@ -102,33 +128,47 @@ def test_r1a_ignores_gate_state():
 
 def test_r1b_fires_on_any_violation():
     v = _viol(**{"ttft.p80": Verdict.VIOLATED, "otps.p80": Verdict.COMFORTABLE})
-    p = steady_growth(v, current=10)
+    p = steady_growth(v, current=10, request_count=100)
     assert p is not None and p.rule == "r1b-steady"
     assert p.replicas == 10 + max(1, int(10 * 0.15 + 0.999))
 
 
 def test_r1b_silent_without_violation():
     v = _viol(**{"ttft.p80": Verdict.GREY, "otps.p80": Verdict.COMFORTABLE})
-    assert steady_growth(v, current=10) is None
+    assert steady_growth(v, current=10, request_count=100) is None
+
+
+def test_r1b_needs_min_requests():
+    """Evidence floor: p80 of N=3 is that single sample. No verdict
+    should be trusted under 20 requests in the 5m window."""
+    v = _viol(**{"ttft.p80": Verdict.VIOLATED})
+    # Wrong implementation would skip the floor. Pin both sides.
+    assert steady_growth(v, current=10, request_count=19) is None
+    assert steady_growth(v, current=10, request_count=20) is not None
+    assert steady_growth(v, current=10, request_count=5) is None
+    # Missing count is also a no-fire.
+    assert steady_growth(v, current=10, request_count=None) is None
 
 
 def test_r1b_min_step_covers_zero_base():
     v = _viol(**{"ttft.p80": Verdict.VIOLATED})
-    p = steady_growth(v, current=0)
+    p = steady_growth(v, current=0, request_count=100)
     assert p is not None
     assert p.replicas >= 1
 
 
 def test_r1b_blocked_when_gate_closed():
     v = _viol(**{"ttft.p80": Verdict.VIOLATED})
-    p = evaluate(v, rejection_rate=0.0, current=10, gates=GATES_CLOSED)
+    p = evaluate(v, rejection_rate=0.0, current=10, gates=GATES_CLOSED,
+                 request_count=100)
     # Up gate closed → r1b unreachable. Shed gate also closed → None.
     assert p is None
 
 
 def test_r1b_fires_when_gate_open():
     v = _viol(**{"ttft.p80": Verdict.VIOLATED})
-    p = evaluate(v, rejection_rate=0.0, current=10, gates=GATES_OPEN)
+    p = evaluate(v, rejection_rate=0.0, current=10, gates=GATES_OPEN,
+                 request_count=100)
     assert p is not None and p.rule == "r1b-steady"
 
 
@@ -173,7 +213,8 @@ def test_r1c_fires_when_gate_open():
 
 def test_r1a_wins_over_r1b():
     v = _viol(**{"ttft.p80": Verdict.VIOLATED})
-    p = evaluate(v, rejection_rate=0.1, current=10, gates=GATES_OPEN)
+    p = evaluate(v, rejection_rate=0.1, current=10, gates=GATES_OPEN,
+                 rejection_count=100, request_count=100)
     assert p.rule == "r1a-fire"
 
 

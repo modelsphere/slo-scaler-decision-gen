@@ -49,6 +49,8 @@ class FakeSignals:
         self.ttft_fn = {}
         self.otps_fn = {}
         self.rejection_val = None
+        self.rejection_count_val = None
+        self.request_count_val = None
         self.replicas_ready_val = None
         self.calls = []
 
@@ -68,6 +70,20 @@ class FakeSignals:
     def rejection_rate(self, ns, svc):
         self.calls.append(("rejection_rate", ns, svc))
         return self._wrap(self.rejection_val)
+
+    def rejection_count_2m(self, ns, svc):
+        self.calls.append(("rejection_count_2m", ns, svc))
+        return self._wrap(self.rejection_count_val)
+
+    def request_count_5m(self, ns, svc):
+        self.calls.append(("request_count_5m", ns, svc))
+        return self._wrap(self.request_count_val)
+
+    def set_rejection_count(self, value):
+        self.rejection_count_val = value
+
+    def set_request_count(self, value):
+        self.request_count_val = value
 
     def replicas_ready(self, ns, svc):
         self.calls.append(("replicas_ready", ns, svc))

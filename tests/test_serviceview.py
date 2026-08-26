@@ -36,11 +36,15 @@ def notraffic(): return Reading(None, "no_traffic")
 
 
 def comfy_readings():
-    """Deep on the safe side of both SLOs."""
+    """Deep on the safe side of both SLOs. Counts are above the R1a/R1b
+    evidence floors (5 rejections / 20 requests) so tests can focus on
+    comfort-vs-hold, not sample-size."""
     return {
         "ttft": {"p80": ok(5.0)},        # ceiling at 20; comfy <10
         "otps": {"p80": ok(100.0)},      # floor at 30; comfy >60
         "rejection": ok(0.0002),
+        "rejection_count": ok(0.0),
+        "request_count": ok(50.0),
     }
 
 
@@ -49,6 +53,8 @@ def violated_readings():
         "ttft": {"p80": ok(25.0)},       # > 20 → violated (ceiling)
         "otps": {"p80": ok(100.0)},
         "rejection": ok(0.001),
+        "rejection_count": ok(0.0),
+        "request_count": ok(50.0),       # over the R1B_MIN_REQUESTS floor
     }
 
 
@@ -67,7 +73,7 @@ def test_boot_seeds_from_spec_replicas():
 def test_boot_clamps_into_min_max():
     p = Placement("ns", "svc", "deployment", "p", 8, "svc", spec_replicas=99)
     v = ServiceView("ns", "svc")
-    v.step(comfy_readings(), p, CR, None, 0.0)
+    v.step(comfy_readings(), p, CR, physical=1, now=0.0)
     assert v.committed == CR["maximumDeployment"]["value"]
 
 
@@ -107,14 +113,40 @@ def test_comfort_resets_on_missing_signal():
     assert v.comfortable_since is None
 
 
-def test_comfort_resets_on_no_traffic_nan():
-    """NaN ≠ no evidence is a real state; comfort cannot sustain off it."""
+def test_no_traffic_counts_as_comfort_for_shed():
+    """R1c: `no_traffic` verdicts are COMFORTABLE (zero demand = deepest
+    comfort); comfort streak does NOT reset; shed proceeds once the
+    down-cooldown and sustainment both pass. `missing_series` continues
+    to reset and hold (test_comfort_resets_on_missing_signal above)."""
+    v = ServiceView("ns", "svc")
+    # Seed at t=0 with normal comfy readings.
+    v.step(comfy_readings(), PLACEMENT, CR, 3, now=0.0)
+    assert v.comfortable_since == 0.0
+
+    # Service goes idle — NaN on both SLO channels.
+    idle = comfy_readings()
+    idle["ttft"]["p80"] = notraffic()
+    idle["otps"]["p80"] = notraffic()
+    t = v.step(idle, PLACEMENT, CR, 3, now=60.0)
+    # Comfort streak must NOT have reset at t=60 — it's still anchored at 0.
+    assert v.comfortable_since == 0.0
+    # Verdicts should be COMFORTABLE (not part of missing_slo), so no
+    # missing-signal hold fired.
+    assert not t.hold_reason.startswith("hold-missing-signal"), t.hold_reason
+
+
+def test_no_traffic_sheds_after_cooldowns():
+    """End-to-end idle-shed: seed at T, stay idle for DOWN_COOLDOWN_S,
+    comfort streak (which now covers idle) also clears COMFORT_SUSTAIN_S.
+    Shed must fire."""
     v = ServiceView("ns", "svc")
     v.step(comfy_readings(), PLACEMENT, CR, 3, now=0.0)
-    nan = comfy_readings()
-    nan["otps"]["p80"] = notraffic()
-    v.step(nan, PLACEMENT, CR, 3, now=60.0)
-    assert v.comfortable_since is None
+    idle = comfy_readings()
+    idle["ttft"]["p80"] = notraffic()
+    idle["otps"]["p80"] = notraffic()
+    # Wait past both cooldowns; comfort anchor is still 0.
+    t = v.step(idle, PLACEMENT, CR, 3, now=float(DOWN_COOLDOWN_S + COMFORT_SUSTAIN_S + 60))
+    assert t.proposal is not None and t.proposal.rule == "r1c-shed", t.hold_reason
 
 
 def test_comfort_resets_on_commit():
@@ -159,16 +191,67 @@ def test_missing_slo_holds_at_committed_and_names_signal():
     assert "otps.p80:missing_series" in t.hold_reason
 
 
-def test_replicas_ready_missing_falls_back_to_committed():
-    """§5 row 2: replication signal missing; estimator magnitude = committed.
-    Service otherwise continues — rule 1 still fires on rejection spike."""
+# ---------- physical ∈ {None, 0} → skip this tick ----------
+
+def test_skip_on_physical_none():
+    """replicas_ready missing → no-stats tick. Don't seed, don't commit,
+    don't fire anything even on a perfect fire signal."""
     v = ServiceView("ns", "svc")
     v.step(comfy_readings(), PLACEMENT, CR, physical=3, now=0.0)
+    assert v.committed == 3
     hot = comfy_readings()
-    hot["rejection"] = ok(0.1)             # r1a fires
+    hot["rejection"] = ok(1.0)
+    hot["rejection_count"] = ok(10.0)
     t = v.step(hot, PLACEMENT, CR, physical=None, now=60.0)
-    # current=committed=3 (fallback), mult > 1 → proposal > 3
-    assert t.proposal is not None and t.proposal.replicas > 3
+    assert t.skip is True
+    assert t.proposal is None
+    assert "no-physical-data" in t.hold_reason
+    # No clock stamp, no comfort reset, since_change hasn't moved from 0 base.
+    assert v.last_change_at == 0.0
+    assert v.comfortable_since == 0.0      # preserved, not reset
+
+
+def test_skip_on_physical_zero():
+    """replicas_ready = 0 means no backends — all signals from it are
+    dead-air data. Same skip posture as None."""
+    v = ServiceView("ns", "svc")
+    v.step(comfy_readings(), PLACEMENT, CR, physical=3, now=0.0)
+    now = 120.0
+    hot = comfy_readings()
+    hot["rejection"] = ok(1.0)
+    hot["rejection_count"] = ok(10.0)
+    t = v.step(hot, PLACEMENT, CR, physical=0, now=now)
+    assert t.skip is True
+    assert t.proposal is None
+    assert v.committed == 3
+    assert v.last_change_at == 0.0         # not stamped at t=120
+    assert v.comfortable_since == 0.0      # anchor preserved from t=0
+
+
+def test_skip_does_not_seed_new_service():
+    """Fresh service, physical=0 on first sight: don't boot-seed off
+    spec.replicas, don't stamp a clock, don't appear on the wire."""
+    v = ServiceView("ns", "svc")
+    t = v.step(comfy_readings(), PLACEMENT, CR, physical=0, now=50.0)
+    assert t.skip is True
+    assert v.committed is None              # unseeded
+    assert v.last_change_at == 0.0          # no clock stamp
+
+
+def test_skip_does_not_reset_comfort_streak():
+    """Comfort was accumulating before the dead-air tick; it must resume
+    seamlessly when real data returns — no reset, no restart."""
+    v = ServiceView("ns", "svc")
+    v.step(comfy_readings(), PLACEMENT, CR, physical=3, now=0.0)
+    v.step(comfy_readings(), PLACEMENT, CR, physical=3, now=60.0)
+    assert v.comfortable_since == 0.0
+    # Dead-air tick mid-streak.
+    v.step(comfy_readings(), PLACEMENT, CR, physical=0, now=120.0)
+    assert v.comfortable_since == 0.0      # unchanged, NOT None
+    # Next real tick: streak is 180s, not 60s.
+    t = v.step(comfy_readings(), PLACEMENT, CR, physical=3, now=180.0)
+    assert t.skip is False
+    assert t.comfort_s == 180
 
 
 # ---------- CR max shrink (C4) ----------
@@ -202,6 +285,7 @@ def test_r1a_fires_immediately_after_boot_with_rejection():
     v = ServiceView("ns", "svc")
     hot = comfy_readings()
     hot["rejection"] = ok(0.1)
+    hot["rejection_count"] = ok(10.0)
     # current physical=3, mult = 1 + 0.1/0.9 × 2 = 1.222; ceil(3×1.222)=4.
     t = v.step(hot, PLACEMENT, CR, physical=3, now=0.0)
     assert t.proposal is not None and t.proposal.rule == "r1a-fire"
@@ -280,6 +364,7 @@ def test_i4_shed_stays_shed_through_drain():
     # mult>1, but direction.reconcile snaps to committed.
     hot = comfy_readings()
     hot["rejection"] = ok(0.1)
+    hot["rejection_count"] = ok(10.0)   # over the R1A_MIN_REJECTIONS floor
     t_spike = v.step(hot, p, big_cr, physical=40, now=shed_at + 120)
     assert t_spike.phase.value == "in-drain"
     assert t_spike.proposal is not None and t_spike.proposal.rule == "r1a-fire"

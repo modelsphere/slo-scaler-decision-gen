@@ -169,6 +169,41 @@ def test_loop_first_tick_proceeds_when_already_synced(fake_slo, fake_k8s, fake_s
     assert _decisions(ctl) == {"svc": 2}
 
 
+def test_skip_keeps_service_on_wire_at_last_committed(
+    fake_slo, fake_k8s, fake_signals, clock, cr_spec,
+):
+    """physical=0 mid-stream: service must NOT vanish from /decisions
+    (the executor would read absence differently from "same value").
+    It also must NOT commit a new value."""
+    _boot(fake_k8s, fake_signals, physical=3)
+    ctl = _mk_ctl(fake_slo, fake_k8s, fake_signals, clock, cr_spec)
+    ctl.tick()
+    assert _decisions(ctl) == {"svc": 2}    # PLACEMENT.spec_replicas=2
+
+    # Drop physical to 0 — exporter sees no backends.
+    fake_signals.set_replicas_ready(0)
+    clock.advance(60)
+    ctl.tick()
+    assert _decisions(ctl) == {"svc": 2}    # stays, unchanged
+
+
+def test_skip_on_first_tick_keeps_service_off_wire(
+    fake_slo, fake_k8s, fake_signals, clock, cr_spec,
+):
+    """Brand-new service whose first reading is physical=0: don't
+    boot-seed, don't serve an entry."""
+    _boot(fake_k8s, fake_signals, physical=0)
+    ctl = _mk_ctl(fake_slo, fake_k8s, fake_signals, clock, cr_spec)
+    ctl.tick()
+    assert _decisions(ctl) == {}
+    # But the view was registered — when physical arrives next tick
+    # the service flows into decisions without a boot reset.
+    fake_signals.set_replicas_ready(3)
+    clock.advance(60)
+    ctl.tick()
+    assert _decisions(ctl) == {"svc": 2}    # boot-seed from spec_replicas=2
+
+
 def test_one_tick_transition_log_is_legible(
     fake_slo, fake_k8s, fake_signals, clock, cr_spec, caplog,
 ):

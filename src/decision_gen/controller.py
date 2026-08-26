@@ -167,6 +167,8 @@ class Controller:
                 "otps": {k: self.signals.otps(ns, svc, k)
                          for k in _kinds_needed(spec, "otps")},
                 "rejection": self.signals.rejection_rate(ns, svc),
+                "rejection_count": self.signals.rejection_count_2m(ns, svc),
+                "request_count": self.signals.request_count_5m(ns, svc),
             }
 
             view = self._views.get(key)
@@ -176,6 +178,12 @@ class Controller:
 
             t = view.step(readings, placement, spec, physical_val, now)
             transitions.append(t)
+            if t.skip:
+                # physical = 0 or missing → no-stats tick. Don't feed the
+                # service to the planner, don't commit anything against it.
+                # State (committed, clocks, comfort) stays frozen in the
+                # view until a real reading lands.
+                continue
 
             mn, mx, pri = _bounds(spec)
             views[key] = view
@@ -205,7 +213,14 @@ class Controller:
         for t in transitions:
             log.info("tick %s/%s %s", t.ns, t.service, _fmt_transition(t))
 
-        committed = {key: v.committed for key, v in views.items()}
+        # Serve every tracked view, including ones skipped this tick —
+        # a temporarily-no-physical service must not vanish from the wire
+        # (the executor would read absence differently from "same value").
+        committed = {
+            key: v.committed
+            for key, v in self._views.items()
+            if v.committed is not None      # never-seeded: nothing to serve
+        }
         with self._lock:
             self._snapshot = wire.to_wire(committed)
         log.info(

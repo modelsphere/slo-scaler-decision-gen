@@ -37,6 +37,10 @@ R1A_CAP               = _env_float("SCALE_UP_MULTIPLIER_CAP",  1.5)
 R1B_STEP_FRAC         = _env_float("SCALE_UP_STEP_FRAC",       0.15)
 R1C_STEP_FRAC         = _env_float("SCALE_DOWN_STEP_FRAC",     0.15)
 
+# Evidence floors: a high rate off tiny N is noise, not signal.
+R1A_MIN_REJECTIONS    = _env_float("R1A_MIN_REJECTIONS_2M",    5.0)   # over 2m
+R1B_MIN_REQUESTS      = _env_float("R1B_MIN_REQUESTS_5M",     20.0)   # over 5m
+
 
 # Cooldown/comfort answers, pre-computed by serviceview. R1a reads
 # neither field — fire alarm is ungated — so neither may shut it off.
@@ -47,17 +51,25 @@ Gates = namedtuple("Gates", ["up_cooldown_open", "shed_ready"])
 Proposal = namedtuple("Proposal", ["replicas", "rule", "reason"])
 
 
-def fire_alarm(rejection_rate, current):
-    """R1a: rejection ≥ 5% → multiplicative scale-up sized to deficit.
+def fire_alarm(rejection_rate, current, rejection_count=None):
+    """R1a: rejection ≥ 5% AND ≥5 rejections in window → multiplicative.
 
     Multiplier is 1 + (r/(1−r)) × GAIN, capped at R1A_CAP. Deficit
     ratio r/(1−r) is the rejected-load fraction of accepted traffic;
     overshooting by ~2× makes recovery faster than drain rate.
 
+    Evidence floor: `rejection_count` is the absolute number of 429s in
+    the 2m window. r = rate is meaningless off N=1; 1 rejected request
+    out of 1 total is 100% but not a capacity emergency. Floor of 5
+    rejects per 2m filters singleton noise. Caller passes None when the
+    reading is missing_series, which also skips — no evidence, no fire.
+
     Never gated. Never a shed: floor is current+1 (C1 zero-base corner
     gives `current+1` when `ceil(current × mult) ≤ current`).
     """
     if rejection_rate is None or rejection_rate < REJECTION_THRESHOLD:
+        return None
+    if rejection_count is None or rejection_count < R1A_MIN_REJECTIONS:
         return None
     # r=1.0 fired ZeroDivisionError at 15:00:42 — the formula explodes
     # exactly when the fire is hottest. Clip to (0, 0.99]: any r ≥ 0.99
@@ -70,25 +82,30 @@ def fire_alarm(rejection_rate, current):
     return Proposal(
         replicas=proposed,
         rule="r1a-fire",
-        reason=f"rej={rejection_rate:.4f} mult={mult:.3f} cur={current}",
+        reason=f"rej={rejection_rate:.4f} n={rejection_count:.0f} mult={mult:.3f} cur={current}",
     )
 
 
-def steady_growth(verdicts, current, frac=R1B_STEP_FRAC):
-    """R1b: any SLO signal VIOLATED → additive step.
+def steady_growth(verdicts, current, request_count=None, frac=R1B_STEP_FRAC):
+    """R1b: any SLO signal VIOLATED AND ≥20 requests in the 5m SLO window.
 
     Step is max(1, ceil(frac × current)) — min-step-1 covers the
     zero-base corner (C5: `ceil(0 × frac) = 0` must not stall growth).
     Cooldown gating is the caller's job (Gates.up_cooldown_open).
-    """
+
+    Evidence floor: TTFT/OTPS quantiles off a handful of requests aren't
+    a distribution — p80 of N=3 IS that single sample. Require ≥20
+    requests in the same 5m window the verdict was evaluated over."""
     if not any(v is Verdict.VIOLATED for v in verdicts.values()):
+        return None
+    if request_count is None or request_count < R1B_MIN_REQUESTS:
         return None
     step = max(1, math.ceil(current * frac))
     viol = sorted(k for k, v in verdicts.items() if v is Verdict.VIOLATED)
     return Proposal(
         replicas=current + step,
         rule="r1b-steady",
-        reason=f"step=+{step} viol={viol}",
+        reason=f"step=+{step} viol={viol} n={request_count:.0f}",
     )
 
 
@@ -114,18 +131,23 @@ def quiet_shed(verdicts, rejection_rate, current, frac=R1C_STEP_FRAC):
     )
 
 
-def evaluate(verdicts, rejection_rate, current, gates):
+def evaluate(verdicts, rejection_rate, current, gates,
+             rejection_count=None, request_count=None):
     """Top-down first-match. None = hold (caller keeps committed).
 
     R1a fires regardless of gate state — reads neither flag.
     R1b requires up_cooldown_open.
     R1c requires shed_ready (cooldown AND comfort-sustain).
-    """
-    p = fire_alarm(rejection_rate, current)
+
+    Counts are evidence floors: R1a needs ≥R1A_MIN_REJECTIONS rejections
+    in the 2m window; R1b needs ≥R1B_MIN_REQUESTS requests in the 5m
+    window. R1c has no floor — comfort + rejection-quiet is enough
+    (a 30-min continuous streak is itself the sample-size argument)."""
+    p = fire_alarm(rejection_rate, current, rejection_count)
     if p is not None:
         return p
     if gates.up_cooldown_open:
-        p = steady_growth(verdicts, current)
+        p = steady_growth(verdicts, current, request_count)
         if p is not None:
             return p
     if gates.shed_ready:
