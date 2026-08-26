@@ -66,6 +66,31 @@ def test_r1a_zero_base_scales_to_one(C1=None):
     assert p.replicas >= 1
 
 
+def test_r1a_at_rejection_1():
+    """15:00:42 incident: r=1.0 divided by zero, crashed the whole tick.
+    Clip at r=0.99 keeps the deficit finite; mult caps at 1.5."""
+    p = fire_alarm(1.0, current=4)
+    assert p is not None
+    assert p.replicas == max(4 + 1, int(4 * 1.5 + 0.999))   # 6
+
+
+def test_r1a_at_rejection_above_1_clipped():
+    """Buggy exporter / formula drift could give r > 1.0 — clip to 0.99,
+    treat as max emergency rather than crash or inversion."""
+    p = fire_alarm(1.5, current=4)
+    assert p is not None
+    assert p.replicas == 6
+
+
+def test_r1a_at_rejection_0_99_hits_cap():
+    """Boundary regression: at r=0.99, deficit=99; mult = 1+99*2 = 199;
+    cap must reduce to 1.5. (Pinning that the cap engages, not just that
+    nothing crashes.)"""
+    p = fire_alarm(0.99, current=4)
+    assert p is not None
+    assert p.replicas == 6   # ceil(4*1.5)=6 vs current+1=5
+
+
 def test_r1a_ignores_gate_state():
     """Ungated by construction: fire_alarm takes no gates argument.
     This test pins that evaluate() checks it first even with gates closed."""

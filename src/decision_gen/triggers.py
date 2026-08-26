@@ -59,7 +59,12 @@ def fire_alarm(rejection_rate, current):
     """
     if rejection_rate is None or rejection_rate < REJECTION_THRESHOLD:
         return None
-    mult = 1.0 + (rejection_rate / (1.0 - rejection_rate)) * R1A_GAIN
+    # r=1.0 fired ZeroDivisionError at 15:00:42 — the formula explodes
+    # exactly when the fire is hottest. Clip to (0, 0.99]: any r ≥ 0.99
+    # is already deep into R1A_CAP territory, and a buggy exporter giving
+    # r < 0 would otherwise invert the direction of the shed check.
+    r = max(0.0, min(0.99, rejection_rate))
+    mult = 1.0 + (r / (1.0 - r)) * R1A_GAIN
     mult = min(mult, R1A_CAP)
     proposed = max(math.ceil(current * mult), current + 1)
     return Proposal(
