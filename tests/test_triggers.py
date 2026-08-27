@@ -28,9 +28,9 @@ def _comfy(n=2):
 
 # ---------- R1a fire_alarm ----------
 
-# Tests below pass rejection_count=100 / request_count=100 to stay above
-# the evidence floors introduced in 2026-08; those floors have their own
-# boundary tests below and don't belong in the sizing-related cases.
+# Tests below pass rejection_count=100 to stay above the evidence floor
+# and slo_violated=True where they're pinning the 1.5 cap behavior;
+# floor and cap-related boundary cases are their own tests below.
 
 def test_r1a_fires_at_threshold():
     p = fire_alarm(0.05, current=10, rejection_count=100)
@@ -47,33 +47,36 @@ def test_r1a_silent_below_threshold():
 def test_r1a_sizes_to_deficit():
     # r=0.0526 ≈ 1/19. deficit = 0.0526/(1-0.0526) ≈ 0.0555.
     # mult = 1 + 0.0555 × 2.0 = 1.111; ceil(10 × 1.111) = 12.
+    # Below both caps → slo_violated argument is irrelevant.
     p = fire_alarm(0.0526, current=10, rejection_count=100)
     assert p.replicas == 12
 
 
 def test_r1a_cap_limits_huge_rejection():
-    # Huge r → mult capped at 1.5.
-    p = fire_alarm(0.9, current=10, rejection_count=100)
+    # Huge r → mult capped at 1.5 when SLO violated.
+    p = fire_alarm(0.9, current=10, rejection_count=100, slo_violated=True)
     assert p.replicas == 15
 
 
 def test_r1a_never_below_current_plus_one():
     # Tiny but above-threshold rejection; ceil(current × mult) may not
-    # exceed current. Floor is current+1.
+    # exceed current. Floor is current+1. mult ≈ 1.105 < both caps.
     p = fire_alarm(0.05, current=100, rejection_count=100)
     assert p.replicas >= 101
 
 
 def test_r1a_zero_base_scales_to_one(C1=None):
-    # C1 / C5: current=0 must not pin.
+    # C1 / C5: current=0 must not pin. mult ≈ 1.22 → below 1.5 violated,
+    # but above the 1.2 clean cap → different behavior by slo state.
+    # Default (clean): ceil(0 × 1.2) = 0 → floor kicks in → 1.
     p = fire_alarm(0.1, current=0, rejection_count=100)
     assert p.replicas >= 1
 
 
 def test_r1a_at_rejection_1():
     """15:00:42 incident: r=1.0 divided by zero, crashed the whole tick.
-    Clip at r=0.99 keeps the deficit finite; mult caps at 1.5."""
-    p = fire_alarm(1.0, current=4, rejection_count=100)
+    Clip at r=0.99 keeps the deficit finite; mult caps at 1.5violated."""
+    p = fire_alarm(1.0, current=4, rejection_count=100, slo_violated=True)
     assert p is not None
     assert p.replicas == max(4 + 1, int(4 * 1.5 + 0.999))   # 6
 
@@ -81,18 +84,47 @@ def test_r1a_at_rejection_1():
 def test_r1a_at_rejection_above_1_clipped():
     """Buggy exporter / formula drift could give r > 1.0 — clip to 0.99,
     treat as max emergency rather than crash or inversion."""
-    p = fire_alarm(1.5, current=4, rejection_count=100)
+    p = fire_alarm(1.5, current=4, rejection_count=100, slo_violated=True)
     assert p is not None
     assert p.replicas == 6
 
 
 def test_r1a_at_rejection_0_99_hits_cap():
-    """Boundary regression: at r=0.99, deficit=99; mult = 1+99*2 = 199;
-    cap must reduce to 1.5. (Pinning that the cap engages, not just that
-    nothing crashes.)"""
-    p = fire_alarm(0.99, current=4, rejection_count=100)
+    """Boundary: at r=0.99, deficit=99; mult = 1+99*2 = 199; cap 1.5violated
+    must reduce to 1.5. (Pinning that the violated cap engages.)"""
+    p = fire_alarm(0.99, current=4, rejection_count=100, slo_violated=True)
     assert p is not None
     assert p.replicas == 6   # ceil(4*1.5)=6 vs current+1=5
+
+
+def test_r1a_clean_slo_cap_is_1_2():
+    """SLOs passing (no VIOLATED) → cap = 1.2, not 1.5. Upstream rejection
+    with healthy SLOs is throttle noise or a burst artifact; respond but
+    don't half-again multiply. GREY counts as clean (conservative)."""
+    # r = 1.0 → uncapped mult would be 199; violated clamps to 1.5, clean to 1.2.
+    p = fire_alarm(1.0, current=10, rejection_count=100, slo_violated=False)
+    assert p.replicas == 12                 # ceil(10 * 1.2)
+    # Same input, violated: 1.5.
+    p = fire_alarm(1.0, current=10, rejection_count=100, slo_violated=True)
+    assert p.replicas == 15                 # ceil(10 * 1.5)
+
+
+def test_r1a_clean_slo_still_floor_plus_one():
+    """At small current, even the 1.2 cap can undershoot current+1;
+    the floor must still fire (C1) under the clean cap too."""
+    # current=3: ceil(3 * 1.2) = 4; current+1 = 4. Equal — same either way.
+    # Try current=1 under clean cap with small r that doesn't reach cap:
+    #   r=0.06: mult = 1 + (0.06/0.94)*2 ≈ 1.128, ceil(1*1.128) = 2.
+    p = fire_alarm(0.06, current=1, rejection_count=100, slo_violated=False)
+    assert p.replicas >= 2
+
+
+def test_r1a_mid_curve_unchanged_by_slo_state():
+    """When the calculated mult is below both caps, slo_violated must not
+    change the outcome — the conditional only kicks in at the cap."""
+    p1 = fire_alarm(0.0526, current=10, rejection_count=100, slo_violated=False)
+    p2 = fire_alarm(0.0526, current=10, rejection_count=100, slo_violated=True)
+    assert p1.replicas == p2.replicas == 12
 
 
 def test_r1a_needs_min_rejections():

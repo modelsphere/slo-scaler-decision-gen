@@ -34,6 +34,7 @@ REJECTION_OK_FLOOR    = _env_float("REJECTION_OK_FLOOR",       0.001)
 
 R1A_GAIN              = _env_float("SCALE_UP_MULTIPLIER_GAIN", 2.0)
 R1A_CAP               = _env_float("SCALE_UP_MULTIPLIER_CAP",  1.5)
+R1A_CAP_CLEAN_SLO     = _env_float("SCALE_UP_MULTIPLIER_CAP_CLEAN_SLO", 1.2)
 R1B_STEP_FRAC         = _env_float("SCALE_UP_STEP_FRAC",       0.15)
 R1C_STEP_FRAC         = _env_float("SCALE_DOWN_STEP_FRAC",     0.15)
 
@@ -51,12 +52,15 @@ Gates = namedtuple("Gates", ["up_cooldown_open", "shed_ready"])
 Proposal = namedtuple("Proposal", ["replicas", "rule", "reason"])
 
 
-def fire_alarm(rejection_rate, current, rejection_count=None):
+def fire_alarm(rejection_rate, current, rejection_count=None, slo_violated=False):
     """R1a: rejection ≥ 5% AND ≥5 rejections in window → multiplicative.
 
-    Multiplier is 1 + (r/(1−r)) × GAIN, capped at R1A_CAP. Deficit
-    ratio r/(1−r) is the rejected-load fraction of accepted traffic;
-    overshooting by ~2× makes recovery faster than drain rate.
+    Multiplier is 1 + (r/(1−r)) × GAIN, capped. When any SLO is VIOLATED
+    the cap is R1A_CAP (1.5) — real capacity hunger, fire hard. When SLOs
+    are clean (no VIOLATED, including GREY-only), the cap tightens to
+    R1A_CAP_CLEAN_SLO (1.2) — upstream rejection without SLO pain is
+    usually a throttle/burst/edge-case artifact, not proof the service
+    itself needs half-again more replicas. Respond, but cautiously.
 
     Evidence floor: `rejection_count` is the absolute number of 429s in
     the 2m window. r = rate is meaningless off N=1; 1 rejected request
@@ -77,7 +81,8 @@ def fire_alarm(rejection_rate, current, rejection_count=None):
     # r < 0 would otherwise invert the direction of the shed check.
     r = max(0.0, min(0.99, rejection_rate))
     mult = 1.0 + (r / (1.0 - r)) * R1A_GAIN
-    mult = min(mult, R1A_CAP)
+    cap = R1A_CAP if slo_violated else R1A_CAP_CLEAN_SLO
+    mult = min(mult, cap)
     proposed = max(math.ceil(current * mult), current + 1)
     return Proposal(
         replicas=proposed,
@@ -143,7 +148,9 @@ def evaluate(verdicts, rejection_rate, current, gates,
     in the 2m window; R1b needs ≥R1B_MIN_REQUESTS requests in the 5m
     window. R1c has no floor — comfort + rejection-quiet is enough
     (a 30-min continuous streak is itself the sample-size argument)."""
-    p = fire_alarm(rejection_rate, current, rejection_count)
+    slo_violated = any(v is Verdict.VIOLATED for v in verdicts.values())
+    p = fire_alarm(rejection_rate, current, rejection_count,
+                   slo_violated=slo_violated)
     if p is not None:
         return p
     if gates.up_cooldown_open:
