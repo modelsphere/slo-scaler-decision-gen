@@ -192,6 +192,23 @@ class Controller:
             placements[key] = (placement.pool, placement.gpus_per_replica)
             bounds[key] = {"min": mn, "max": mx, "priority": pri}
 
+        # 3b. Warn loudly when Σ min × gpr > capacity for any pool — mins
+        # are CR authority and we will honor them regardless, but the
+        # scheduler cannot place what doesn't fit; pods will go Pending.
+        min_needed = {}
+        for key, b in bounds.items():
+            pool, gpr = placements[key]
+            min_needed[pool] = min_needed.get(pool, 0) + b["min"] * gpr
+        for pool, need in min_needed.items():
+            have = capacity.get(pool, 0)
+            if need > have:
+                log.warning(
+                    "pool %s UNDER-PROVISIONED: Σ CR min × gpr = %d GPUs "
+                    "but pool capacity = %d (short %d). Honoring mins "
+                    "anyway; kube-scheduler will mark excess pods Pending.",
+                    pool, need, have, need - have,
+                )
+
         # 4. Ledger gap: Σ ready GPUs − Σ committed × gpr.
         gap = dict(capacity)
         for key, n in booked.items():

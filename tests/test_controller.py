@@ -204,6 +204,34 @@ def test_skip_on_first_tick_keeps_service_off_wire(
     assert _decisions(ctl) == {"svc": 2}    # boot-seed from spec_replicas=2
 
 
+def test_warns_when_pool_cannot_fit_all_mins(
+    fake_slo, fake_k8s, fake_signals, clock, cr_spec, caplog,
+):
+    """Σ CR min × gpr = 16 but capacity = 8: must log a single LOUD
+    warning so the under-provisioning is visible. Mins still served."""
+    import dataclasses
+    cr2 = dict(cr_spec, minimumDeployment={"type": "replica", "value": 1})
+    fake_slo.set("ns", "svc", cr_spec)
+    fake_slo.set("ns", "svc2", cr2)
+    fake_k8s.placements[("ns", "svc")] = PLACEMENT
+    fake_k8s.placements[("ns", "svc2")] = dataclasses.replace(PLACEMENT, name="svc2")
+    fake_k8s.capacity = {"p": 8}
+    fake_signals.set_replicas_ready(1)
+    fake_signals.set_ttft("ns", "svc", "p80", 5.0)
+    fake_signals.set_ttft("ns", "svc2", "p80", 5.0)
+    fake_signals.set_otps("ns", "svc", "p80", 100.0)
+    fake_signals.set_otps("ns", "svc2", "p80", 100.0)
+    fake_signals.set_rejection(0.0)
+    ctl = Controller(slo=fake_slo, k8s=fake_k8s, signals=fake_signals,
+                     tick_seconds=60, clock=clock)
+    with caplog.at_level(logging.WARNING, logger="decision_gen.controller"):
+        ctl.tick()
+    warned = [r.getMessage() for r in caplog.records if "UNDER-PROVISIONED" in r.getMessage()]
+    assert warned, "expected a loud warning when mins exceed pool capacity"
+    msg = warned[0]
+    assert "16 GPUs" in msg and "capacity = 8" in msg and "short 8" in msg
+
+
 def test_one_tick_transition_log_is_legible(
     fake_slo, fake_k8s, fake_signals, clock, cr_spec, caplog,
 ):

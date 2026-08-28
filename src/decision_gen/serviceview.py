@@ -64,15 +64,24 @@ Transition = namedtuple("Transition", [
 ])
 
 
+_UNBOUNDED_MAX = 10**9   # stands in when the CR omits maximumDeployment
+
+
 def _bounds(cr_spec):
-    """(min, max, priority). Malformed min>max clamps max=min, warns (R9)."""
+    """(min, max, priority). Malformed min>max clamps max=min, warns (R9).
+    Missing maximumDeployment means "no upper bound" — clamp to a large
+    sentinel instead of to min, and warn so the CR author notices."""
     def _i(blk, default):
         try:
             return int((blk or {}).get("value", default))
         except (TypeError, ValueError):
             return default
     mn = _i(cr_spec.get("minimumDeployment"), 1)
-    mx = _i(cr_spec.get("maximumDeployment"), mn)
+    if cr_spec.get("maximumDeployment") is None:
+        log.warning("CR missing maximumDeployment; treating as unbounded")
+        mx = _UNBOUNDED_MAX
+    else:
+        mx = _i(cr_spec.get("maximumDeployment"), mn)
     if mn > mx:
         log.warning("CR min>max (%s>%s); clamp max=min", mn, mx)
         mx = mn

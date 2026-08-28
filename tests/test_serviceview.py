@@ -77,6 +77,24 @@ def test_boot_clamps_into_min_max():
     assert v.committed == CR["maximumDeployment"]["value"]
 
 
+def test_missing_max_means_unbounded():
+    """No maximumDeployment in CR → no upper clamp (treated as a large
+    sentinel). Boot-seed must NOT pin spec.replicas down to min."""
+    from decision_gen.serviceview import _bounds, _UNBOUNDED_MAX
+    cr_no_max = {
+        "minimumDeployment": {"type": "replica", "value": 1},
+        "ttft": {"default": {"metrics": [{"type": "p80", "threshold": 20.0}]}},
+        "otps": {"default": {"metrics": [{"type": "p80", "threshold": 30.0}]}},
+    }
+    mn, mx, _ = _bounds(cr_no_max)
+    assert mx == _UNBOUNDED_MAX
+    # End-to-end: spec_replicas=99 with min=1, no max → seed at 99, not 1.
+    p = Placement("ns", "svc", "deployment", "p", 8, "svc", spec_replicas=99)
+    v = ServiceView("ns", "svc")
+    v.step(comfy_readings(), p, cr_no_max, physical=1, now=0.0)
+    assert v.committed == 99
+
+
 def test_boot_stamps_clock_and_zeroes_comfort():
     v = ServiceView("ns", "svc")
     v.step(comfy_readings(), PLACEMENT, CR, physical=3, now=100.0)
