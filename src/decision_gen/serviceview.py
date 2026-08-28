@@ -36,9 +36,9 @@ def _env_float(name, default):
     return float(os.environ.get(name, default))
 
 
-UP_COOLDOWN_S     = _env_int("SCALE_UP_COOLDOWN_S",    1800)
-DOWN_COOLDOWN_S   = _env_int("SCALE_DOWN_COOLDOWN_S",  3600)
-COMFORT_SUSTAIN_S = _env_int("SCALE_DOWN_COMFORT_S",   1800)
+UP_COOLDOWN_S     = _env_int("SCALE_UP_COOLDOWN_S",     900)   # 15 min
+DOWN_COOLDOWN_S   = _env_int("SCALE_DOWN_COOLDOWN_S",  1800)   # 30 min
+COMFORT_SUSTAIN_S = _env_int("SCALE_DOWN_COMFORT_S",   1200)   # 20 min
 SLO_HEADROOM      = _env_float("SLO_HEADROOM",          0.5)
 
 
