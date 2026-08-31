@@ -67,20 +67,16 @@ Transition = namedtuple("Transition", [
 def _bounds(cr_spec):
     """(min, max, priority), or None if maximumDeployment is absent.
 
-    Missing max = user opted out of autoscaling. Caller must skip the
-    service entirely — we won't pick a clamp value for them. Malformed
-    min>max clamps max=min, warns (R9)."""
+    Missing max = user opted out of autoscaling. Caller decides what to
+    do with that (skip vs unbounded) and logs any diagnostic — this
+    helper stays pure. Malformed min>max clamps to max=min and warns,
+    since that's a repairable shape problem, not an opt-out signal."""
     def _i(blk, default):
         try:
             return int((blk or {}).get("value", default))
         except (TypeError, ValueError):
             return default
     if cr_spec.get("maximumDeployment") is None:
-        log.warning(
-            "CR missing maximumDeployment: %s/%s — service is unmanaged "
-            "(not autoscaled); skipping every tick until set",
-            (cr_spec.get("namespace") or "?"), cr_spec.get("serviceId") or "?",
-        )
         return None
     mn = _i(cr_spec.get("minimumDeployment"), 1)
     mx = _i(cr_spec.get("maximumDeployment"), mn)

@@ -153,6 +153,16 @@ class Controller:
 
         for (ns, svc), spec in sorted(crs.items()):
             key = (ns, svc)
+            # Missing maximumDeployment is an opt-out signal from the CR
+            # author: skip the service entirely, don't even fetch signals.
+            if _bounds(spec) is None:
+                log.warning(
+                    "%s/%s: CR missing maximumDeployment — unmanaged "
+                    "(not autoscaled); skipping every tick until set",
+                    ns, svc,
+                )
+                continue
+
             placement = self.k8s.resolve_placement(ns, svc)
             if placement is None:
                 log.warning("%s/%s: placement unresolvable; skipping tick", ns, svc)
