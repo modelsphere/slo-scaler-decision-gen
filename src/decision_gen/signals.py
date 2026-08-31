@@ -92,7 +92,7 @@ class Signals:
             log.warning("prom bad json | %s%s: %s", tag, promql, e)
             return Reading(None, "missing_series")
         if not rows:
-            log.info("prom 0 rows | %s%s", tag, promql)
+            log.warning("prom 0 rows | %s%s", tag, promql)
             return Reading(None, "missing_series")
         if len(rows) > 1:
             log.warning("prom >1 row | %s%s (%d rows)", tag, promql, len(rows))

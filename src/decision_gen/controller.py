@@ -153,6 +153,7 @@ class Controller:
 
         for (ns, svc), spec in sorted(crs.items()):
             key = (ns, svc)
+            log.info("─── %s/%s %s", ns, svc, "─" * max(0, 60 - len(ns) - len(svc)))
             # Missing maximumDeployment is an opt-out signal from the CR
             # author: skip the service entirely, don't even fetch signals.
             if _bounds(spec) is None:
