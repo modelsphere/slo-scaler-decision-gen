@@ -232,6 +232,30 @@ def test_warns_when_pool_cannot_fit_all_mins(
     assert "16 GPUs" in msg and "capacity = 8" in msg and "short 8" in msg
 
 
+def test_missing_max_keeps_service_off_wire(
+    fake_slo, fake_k8s, fake_signals, clock, caplog,
+):
+    """CR without maximumDeployment → user opted out. Service is skipped
+    (logged once per tick at WARNING) and never appears in /decisions."""
+    cr_no_max = {
+        "serviceId": "svc",
+        "ttft": {"default": {"metrics": [{"type": "p80", "threshold": 20.0}]}},
+        "otps": {"default": {"metrics": [{"type": "p80", "threshold": 30.0}]}},
+    }
+    fake_slo.set("ns", "svc", cr_no_max)
+    fake_k8s.placements[("ns", "svc")] = PLACEMENT
+    fake_k8s.capacity = {"p": 64}
+    fake_signals.set_replicas_ready(2)
+    ctl = Controller(slo=fake_slo, k8s=fake_k8s, signals=fake_signals,
+                     tick_seconds=60, clock=clock)
+    with caplog.at_level(logging.WARNING):
+        ctl.tick()
+    assert _decisions(ctl) == {}
+    warned = [r.getMessage() for r in caplog.records
+              if "missing maximumDeployment" in r.getMessage()]
+    assert warned, "expected loud warning on missing max"
+
+
 def test_one_tick_transition_log_is_legible(
     fake_slo, fake_k8s, fake_signals, clock, cr_spec, caplog,
 ):

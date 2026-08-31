@@ -64,24 +64,26 @@ Transition = namedtuple("Transition", [
 ])
 
 
-_UNBOUNDED_MAX = 10**9   # stands in when the CR omits maximumDeployment
-
-
 def _bounds(cr_spec):
-    """(min, max, priority). Malformed min>max clamps max=min, warns (R9).
-    Missing maximumDeployment means "no upper bound" — clamp to a large
-    sentinel instead of to min, and warn so the CR author notices."""
+    """(min, max, priority), or None if maximumDeployment is absent.
+
+    Missing max = user opted out of autoscaling. Caller must skip the
+    service entirely — we won't pick a clamp value for them. Malformed
+    min>max clamps max=min, warns (R9)."""
     def _i(blk, default):
         try:
             return int((blk or {}).get("value", default))
         except (TypeError, ValueError):
             return default
-    mn = _i(cr_spec.get("minimumDeployment"), 1)
     if cr_spec.get("maximumDeployment") is None:
-        log.warning("CR missing maximumDeployment; treating as unbounded")
-        mx = _UNBOUNDED_MAX
-    else:
-        mx = _i(cr_spec.get("maximumDeployment"), mn)
+        log.warning(
+            "CR missing maximumDeployment: %s/%s — service is unmanaged "
+            "(not autoscaled); skipping every tick until set",
+            (cr_spec.get("namespace") or "?"), cr_spec.get("serviceId") or "?",
+        )
+        return None
+    mn = _i(cr_spec.get("minimumDeployment"), 1)
+    mx = _i(cr_spec.get("maximumDeployment"), mn)
     if mn > mx:
         log.warning("CR min>max (%s>%s); clamp max=min", mn, mx)
         mx = mn
@@ -143,14 +145,27 @@ class ServiceView:
         readings: {'ttft': {kind: Reading}, 'otps': {kind: Reading},
                    'rejection': Reading}
         physical: int | None — replicas_ready; None or 0 = no-stats, skip.
-
-        physical ∈ {None, 0} → no-op tick. We can't trust any SLO /
-        rejection signal derived from zero backends, and seeding or
-        re-stamping clocks off dead-air data has burned us. Returns a
-        Transition with skip=True; controller excludes the service from
-        the planner this tick. State (committed, clocks, comfort streak)
-        is frozen until a real reading arrives.
+        CR missing maximumDeployment → skip: user opted out of autoscale.
         """
+        bounds = _bounds(cr_spec)
+        if bounds is None:
+            return Transition(
+                ns=self.ns, service=self.service,
+                pool=placement.pool, gpr=placement.gpus_per_replica,
+                kind=placement.kind, spec_replicas=placement.spec_replicas,
+                readings=readings, verdicts={"ttft": {}, "otps": {}},
+                physical=physical,
+                gates=triggers.Gates(up_cooldown_open=False, shed_ready=False),
+                since_change_s=int(now - self.last_change_at),
+                comfort_s=(None if self.comfortable_since is None
+                           else int(now - self.comfortable_since)),
+                phase=direction.Phase.SETTLED,
+                proposal=None,
+                est=self.committed if self.committed is not None else 0,
+                want=self.committed if self.committed is not None else 0,
+                hold_reason="hold-no-max-in-cr (user opted out of autoscale)",
+                skip=True,
+            )
         if physical is None or physical == 0:
             return Transition(
                 ns=self.ns, service=self.service,
@@ -170,7 +185,7 @@ class ServiceView:
                 skip=True,
             )
         self._ensure_seeded(cr_spec, placement, now)
-        mn, mx, _pri = _bounds(cr_spec)
+        mn, mx, _pri = bounds
 
         # C4: CR max shrunk below committed → compress immediately.
         # Bypasses cooldowns, freezes, missing-signal holds; CR is
