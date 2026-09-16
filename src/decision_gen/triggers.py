@@ -136,6 +136,39 @@ def quiet_shed(verdicts, rejection_rate, current, frac=R1C_STEP_FRAC):
     )
 
 
+def evaluate_job(verdicts, current, gates):
+    """JobSLO sizing rule — step-only, depth-driven.
+
+    No fire-alarm analog: a queue spike with depth >> maxDepth proposes
+    the same step as a mild overshoot; evidence floors are the CR's
+    PromQL responsibility (e.g. `... or vector(0)` for idle-zero).
+
+    Step-up: any VIOLATED + up_cooldown_open → +R1B_STEP_FRAC, min 1.
+    Shed:    all COMFORTABLE + shed_ready     → −R1C_STEP_FRAC, min 1.
+    GREY is not comfy (R3); verdict=None (missing signal) is the caller's
+    hold path — we never see it here.
+    """
+    if not verdicts:
+        return None
+    if gates.up_cooldown_open and any(
+            v is Verdict.VIOLATED for v in verdicts.values()):
+        step = max(1, math.ceil(current * R1B_STEP_FRAC))
+        return Proposal(
+            replicas=current + step,
+            rule="rjob-step-up",
+            reason=f"step=+{step}",
+        )
+    if gates.shed_ready and all(
+            v is Verdict.COMFORTABLE for v in verdicts.values()):
+        step = max(1, math.ceil(current * R1C_STEP_FRAC))
+        return Proposal(
+            replicas=current - step,
+            rule="rjob-shed",
+            reason=f"step=-{step}",
+        )
+    return None
+
+
 def evaluate(verdicts, rejection_rate, current, gates,
              rejection_count=None, request_count=None):
     """Top-down first-match. None = hold (caller keeps committed).

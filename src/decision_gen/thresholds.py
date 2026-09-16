@@ -40,6 +40,7 @@ class Verdict(Enum):
 METRIC_DIRECTION = {
     "ttft": Direction.CEILING,
     "otps": Direction.FLOOR,
+    "queue": Direction.CEILING,   # depth-per-replica vs queue.maxDepth
 }
 
 

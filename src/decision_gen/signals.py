@@ -179,6 +179,43 @@ class Signals:
             label="req.count",
         )
 
+    def job_replicas_ready(self, namespace, deployment_name):
+        """Physical ready replicas for job workloads, via kube-state-metrics.
+
+        LLM services use `bodylog_service_replicas_ready` — a ModelForge-
+        scoped exporter series keyed by `service="ns/svc"`, smoothed
+        `avg_over_time(2m)` to survive single-scrape gaps during drain.
+        Job workloads use kube-state-metrics'
+        `kube_deployment_status_replicas_ready` — keyed by
+        `{namespace, deployment}` — and read the **instant** value.
+        kube-state-metrics is itself resilient to pod restarts (it
+        re-reports state each scrape from the apiserver, not from
+        emitting pods), so the 2m smoothing LLM needs is unnecessary
+        here and would only hide legitimate zero-replica windows.
+
+        `max by(deployment)` collapses any duplicate exporter instances
+        (>1 row → treated as missing). Values are rounded to int so
+        direction.phase_of sees a stable int.
+        """
+        r = self._query(
+            f'max by(deployment)('
+            f'kube_deployment_status_replicas_ready'
+            f'{{namespace="{namespace}", deployment="{deployment_name}"}})',
+            label=f"job.replicas[{namespace}/{deployment_name}]",
+        )
+        if r.state != "ok":
+            return r
+        return Reading(int(r.value + 0.5), "ok")
+
+    def queue_depth(self, namespace, service_id, promql):
+        """Total queue depth — shape and aggregation live in the CR's
+        `queue.promql`. Returns the Reading as-is; the CR owns zero-fill
+        semantics (`or vector(0)` when the author wants idle→comfy).
+
+        Caller divides by live replica count to get per-replica depth,
+        which is what `maxDepth` bounds."""
+        return self._query(promql, label=f"queue.depth[{namespace}/{service_id}]")
+
     def replicas_ready(self, namespace, service_id):
         """Physical ready replicas (bodylog_service_replicas_ready).
 

@@ -49,8 +49,10 @@ def _kinds_needed(cr_spec, signal):
 
 
 class Controller:
-    def __init__(self, slo, k8s, signals, tick_seconds=60, clock=time.time):
+    def __init__(self, slo, k8s, signals, tick_seconds=60, clock=time.time,
+                 slo_job=None):
         self.slo = slo
+        self.slo_job = slo_job  # JobSLO watcher; None in tests that only exercise LLM
         self.k8s = k8s
         self.signals = signals
         self.tick_seconds = tick_seconds
@@ -104,6 +106,18 @@ class Controller:
                      time.monotonic() - t)
         else:
             log.warning("controller: slo not synced after 10s; first tick anyway")
+        # Job store: same posture but tolerate-404 — jobslo CRD may not
+        # be installed on every cluster. A missing CRD leaves the watcher
+        # in retry-with-backoff; wait_synced times out and we tick with
+        # an empty job set.
+        if self.slo_job is not None:
+            if self.slo_job.wait_synced(timeout=5):
+                log.info("controller: job-slo synced; first tick")
+            else:
+                log.warning(
+                    "controller: job-slo not synced after 5s "
+                    "(jobslo CRD may be absent); continuing with zero job CRs",
+                )
         while not self._stop.is_set():
             started = time.time()
             try:
@@ -127,12 +141,23 @@ class Controller:
                  time.monotonic() - t0, len(crs))
 
         # 1. Free ledger entries for deleted CRs BEFORE gap computation.
+        #    Job SLOs arrive via a separate watcher; a key is live iff
+        #    it appears in either snapshot.
+        crs_job = self.slo_job.snapshot() if self.slo_job is not None else {}
         for key in list(self._views):
-            if key not in crs:
-                del self._views[key]
-                log.info("%s/%s: CR deleted; freed ledger entry", *key)
+            if key in crs or key in crs_job:
+                continue
+            del self._views[key]
+            log.info("%s/%s: CR deleted; freed ledger entry", *key)
 
-        if not crs:
+        # Merge both kinds into one iteration. Placement, bounds,
+        # planner input, and the transition format are shared; only the
+        # readings dict shape differs (view.step() dispatches on the
+        # CR spec's shape, not on a kind tag).
+        merged = [(k, s, "llm") for k, s in sorted(crs.items())]
+        merged += [(k, s, "job") for k, s in sorted(crs_job.items())]
+
+        if not merged:
             with self._lock:
                 self._snapshot = wire.to_wire({})
             return
@@ -151,9 +176,10 @@ class Controller:
         bounds = {}        # {(ns,svc): {'min','max','priority'}}
         views = {}
 
-        for (ns, svc), spec in sorted(crs.items()):
+        for (ns, svc), spec, cr_kind in merged:
             key = (ns, svc)
-            log.info("─── %s/%s %s", ns, svc, "─" * max(0, 60 - len(ns) - len(svc)))
+            log.info("─── %s/%s (%s) %s", ns, svc, cr_kind,
+                     "─" * max(0, 56 - len(ns) - len(svc) - len(cr_kind)))
             # Missing maximumDeployment is an opt-out signal from the CR
             # author: skip the service entirely, don't even fetch signals.
             if _bounds(spec) is None:
@@ -169,25 +195,36 @@ class Controller:
                 log.warning("%s/%s: placement unresolvable; skipping tick", ns, svc)
                 continue
 
-            physical = self.signals.replicas_ready(ns, svc)
-            physical_val = physical.value if physical.state == "ok" else None
-
-            readings = {
-                "ttft": {k: self.signals.ttft(ns, svc, k)
-                         for k in _kinds_needed(spec, "ttft")},
-                "otps": {k: self.signals.otps(ns, svc, k)
-                         for k in _kinds_needed(spec, "otps")},
-                "rejection": self.signals.rejection_rate(ns, svc),
-                "rejection_count": self.signals.rejection_count_2m(ns, svc),
-                "request_count": self.signals.request_count_5m(ns, svc),
-            }
+            if cr_kind == "job":
+                physical = self.signals.job_replicas_ready(ns, svc)
+                physical_val = physical.value if physical.state == "ok" else None
+                promql = (spec.get("queue") or {}).get("promql")
+                if not promql:
+                    log.warning("%s/%s: job CR missing queue.promql; skipping", ns, svc)
+                    continue
+                readings = {
+                    "queue_depth": self.signals.queue_depth(ns, svc, promql),
+                }
+            else:
+                physical = self.signals.replicas_ready(ns, svc)
+                physical_val = physical.value if physical.state == "ok" else None
+                readings = {
+                    "ttft": {k: self.signals.ttft(ns, svc, k)
+                             for k in _kinds_needed(spec, "ttft")},
+                    "otps": {k: self.signals.otps(ns, svc, k)
+                             for k in _kinds_needed(spec, "otps")},
+                    "rejection": self.signals.rejection_rate(ns, svc),
+                    "rejection_count": self.signals.rejection_count_2m(ns, svc),
+                    "request_count": self.signals.request_count_5m(ns, svc),
+                }
 
             view = self._views.get(key)
             if view is None:
                 view = ServiceView(ns, svc)
                 self._views[key] = view
 
-            t = view.step(readings, placement, spec, physical_val, now)
+            t = view.step(readings, placement, spec, physical_val, now,
+                          kind=cr_kind)
             transitions.append(t)
             if t.skip:
                 # physical = 0 or missing → no-stats tick. Don't feed the
@@ -273,6 +310,16 @@ def _fmt_transition(t):
             v = t.verdicts.get(signal, {}).get(kind)
             sym = {Verdict.VIOLATED: "✗", Verdict.COMFORTABLE: "✓"}.get(v, "~")
             parts.append(f"[{tag}]={r.value:g}{sym}")
+    # Jobs carry depth under the flat "queue_depth" key instead of a
+    # per-kind nested dict. Print it explicitly with its verdict.
+    qd = t.readings.get("queue_depth")
+    if qd is not None:
+        v = t.verdicts.get("queue", {}).get("depth")
+        sym = {Verdict.VIOLATED: "✗", Verdict.COMFORTABLE: "✓"}.get(v, "~")
+        if qd.state == "ok":
+            parts.append(f"[queue.depth]={qd.value:g}{sym}")
+        else:
+            parts.append(f"[queue.depth]={qd.state}")
     rej = t.readings.get("rejection")
     if rej is not None:
         parts.append(f"[rej]={rej.value:g}" if rej.state == "ok" else f"[rej]={rej.state}")

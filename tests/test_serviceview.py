@@ -253,14 +253,16 @@ def test_skip_on_physical_zero():
     assert v.comfortable_since == 0.0      # anchor preserved from t=0
 
 
-def test_skip_does_not_seed_new_service():
-    """Fresh service, physical=0 on first sight: don't boot-seed off
-    spec.replicas, don't stamp a clock, don't appear on the wire."""
+def test_skip_still_seeds_new_service():
+    """Fresh service, physical=0 on first sight: still boot-seed from
+    spec.replicas (which doesn't depend on prom), so /decisions can show
+    the service at its seeded committed. Skip means "don't decide", not
+    "deny the service exists on the wire"."""
     v = ServiceView("ns", "svc")
     t = v.step(comfy_readings(), PLACEMENT, CR, physical=0, now=50.0)
     assert t.skip is True
-    assert v.committed is None              # unseeded
-    assert v.last_change_at == 0.0          # no clock stamp
+    assert v.committed == 3                 # seeded from spec.replicas
+    assert v.last_change_at == 50.0         # clock stamped at seed time
 
 
 def test_skip_does_not_reset_comfort_streak():

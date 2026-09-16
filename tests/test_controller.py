@@ -187,21 +187,23 @@ def test_skip_keeps_service_on_wire_at_last_committed(
     assert _decisions(ctl) == {"svc": 2}    # stays, unchanged
 
 
-def test_skip_on_first_tick_keeps_service_off_wire(
+def test_skip_on_first_tick_still_serves_seeded_value(
     fake_slo, fake_k8s, fake_signals, clock, cr_spec,
 ):
-    """Brand-new service whose first reading is physical=0: don't
-    boot-seed, don't serve an entry."""
+    """Brand-new service whose first reading is physical=0: the seed
+    comes from spec.replicas, not prom — so the wire advertises the
+    service at its seeded committed right away, then tick N+1 (once
+    physical is available) proceeds from that baseline without a
+    visible flap."""
     _boot(fake_k8s, fake_signals, physical=0)
     ctl = _mk_ctl(fake_slo, fake_k8s, fake_signals, clock, cr_spec)
     ctl.tick()
-    assert _decisions(ctl) == {}
-    # But the view was registered — when physical arrives next tick
-    # the service flows into decisions without a boot reset.
+    assert _decisions(ctl) == {"svc": 2}    # seeded from spec_replicas=2
+    # Next tick, physical arrives — committed stays pinned by the seed.
     fake_signals.set_replicas_ready(3)
     clock.advance(60)
     ctl.tick()
-    assert _decisions(ctl) == {"svc": 2}    # boot-seed from spec_replicas=2
+    assert _decisions(ctl) == {"svc": 2}    # unchanged; seed held
 
 
 def test_warns_when_pool_cannot_fit_all_mins(

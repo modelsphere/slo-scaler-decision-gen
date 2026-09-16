@@ -47,8 +47,10 @@ Transition = namedtuple("Transition", [
     # placement
     "pool", "gpr", "kind", "spec_replicas",
     # raw evidence
-    "readings",            # {'ttft': {kind: Reading}, 'otps': {...}, 'rejection': Reading}
-    "verdicts",            # {'ttft': {kind: Verdict|None}, 'otps': {...}}
+    "readings",            # llm: {'ttft': {kind: Reading}, 'otps': {...}, 'rejection': Reading}
+                           # job: {'queue_depth': Reading}
+    "verdicts",            # llm: {'ttft': {kind: Verdict|None}, 'otps': {...}}
+                           # job: {'queue': {'depth': Verdict|None}}
     "physical",            # prom replicas_ready, int | None
     # gates + streaks at decision time
     "gates",               # triggers.Gates
@@ -133,15 +135,19 @@ class ServiceView:
 
     # ---------- main ----------
 
-    def step(self, readings, placement, cr_spec, physical, now):
+    def step(self, readings, placement, cr_spec, physical, now, kind="llm"):
         """One tick for this service. Returns a Transition. Does NOT
         commit; the controller commits after the planner arbitrates
         across services.
 
-        readings: {'ttft': {kind: Reading}, 'otps': {kind: Reading},
-                   'rejection': Reading}
+        readings: llm — {'ttft': {kind: Reading}, 'otps': {...},
+                         'rejection': Reading, ...}
+                  job — {'queue_depth': Reading}
         physical: int | None — replicas_ready; None or 0 = no-stats, skip.
         CR missing maximumDeployment → skip: user opted out of autoscale.
+        kind: "llm" | "job" — which verdict algebra to apply. The
+              controller knows this from which watcher produced the CR;
+              pass it down rather than sniffing the spec shape here.
         """
         bounds = _bounds(cr_spec)
         if bounds is None:
@@ -162,12 +168,21 @@ class ServiceView:
                 hold_reason="hold-no-max-in-cr (user opted out of autoscale)",
                 skip=True,
             )
+        # Seed FIRST. spec.replicas is authoritative boot state; physical
+        # is only needed for the *decision* phase below. A service whose
+        # physical signal is missing must still appear on the wire with
+        # its seeded committed, otherwise /decisions reads as "unmanaged"
+        # for any service whose replicas_ready exporter is absent —
+        # which includes whole classes of workloads that never had the
+        # LLM exporter (jobs being the first example).
+        self._ensure_seeded(cr_spec, placement, now)
         if physical is None or physical == 0:
+            empty_verdicts = {"queue": {}} if kind == "job" else {"ttft": {}, "otps": {}}
             return Transition(
                 ns=self.ns, service=self.service,
                 pool=placement.pool, gpr=placement.gpus_per_replica,
                 kind=placement.kind, spec_replicas=placement.spec_replicas,
-                readings=readings, verdicts={"ttft": {}, "otps": {}},
+                readings=readings, verdicts=empty_verdicts,
                 physical=physical,
                 gates=triggers.Gates(up_cooldown_open=False, shed_ready=False),
                 since_change_s=int(now - self.last_change_at),
@@ -180,7 +195,6 @@ class ServiceView:
                 hold_reason=f"hold-no-physical-data physical={physical}",
                 skip=True,
             )
-        self._ensure_seeded(cr_spec, placement, now)
         mn, mx, _pri = bounds
 
         # C4: CR max shrunk below committed → compress immediately.
@@ -190,28 +204,24 @@ class ServiceView:
         if self.committed > mx:
             self.commit(mx, now, cause="cr-max-shrink")
 
-        # ---- verdicts ----
-        # `no_traffic` (histogram_quantile NaN = zero requests in window)
-        # contributes COMFORTABLE, not missing: zero demand IS the deepest
-        # possible comfort. `missing_series` (query 0-rows / bad shape /
-        # transport error) continues to mean "no evidence; hold".
-        verdicts = {"ttft": {}, "otps": {}}
-        missing_slo = []
-        for signal in ("ttft", "otps"):
-            for kind, r in (readings.get(signal) or {}).items():
-                if r.state == "ok":
-                    thr = _threshold(cr_spec, signal, kind)
-                    verdicts[signal][kind] = classify(
-                        METRIC_DIRECTION[signal], r.value, thr, SLO_HEADROOM,
-                    )
-                elif r.state == "no_traffic":
-                    verdicts[signal][kind] = Verdict.COMFORTABLE
-                else:   # missing_series / unknown
-                    missing_slo.append(f"{signal}.{kind}:{r.state}")
-                    verdicts[signal][kind] = None
+        is_job = (kind == "job")
 
-        rej = readings.get("rejection")
-        rej_value = rej.value if rej is not None and rej.state == "ok" else None
+        # ---- verdicts ----
+        # `no_traffic` (histogram_quantile NaN = zero requests in window,
+        # or an `or vector(0)` job PromQL returning literal 0) contributes
+        # COMFORTABLE, not missing: zero demand IS the deepest possible
+        # comfort. `missing_series` (query 0-rows / bad shape / transport
+        # error) continues to mean "no evidence; hold".
+        if is_job:
+            verdicts, missing_slo = self._job_verdicts(
+                readings, cr_spec, physical,
+            )
+            rej = None             # jobs have no rejection signal
+            rej_value = None
+        else:
+            verdicts, missing_slo = self._llm_verdicts(readings, cr_spec)
+            rej = readings.get("rejection")
+            rej_value = rej.value if rej is not None and rej.state == "ok" else None
 
         # ---- comfort streak (R4) ----
         # Reset events: commit (inside commit()), any MISSING-series signal,
@@ -259,19 +269,22 @@ class ServiceView:
             for sig, by_kind in verdicts.items()
             for kind, v in by_kind.items()
         }
-        # Evidence floors for R1a/R1b come in as sample counts.
-        rej_count_reading = readings.get("rejection_count")
-        req_count_reading = readings.get("request_count")
-        rej_count = (rej_count_reading.value
-                     if rej_count_reading is not None and rej_count_reading.state == "ok"
-                     else None)
-        req_count = (req_count_reading.value
-                     if req_count_reading is not None and req_count_reading.state == "ok"
-                     else None)
-        proposal = triggers.evaluate(
-            flat_verdicts, rej_value, current, gates,
-            rejection_count=rej_count, request_count=req_count,
-        )
+        if is_job:
+            proposal = triggers.evaluate_job(flat_verdicts, current, gates)
+        else:
+            # Evidence floors for R1a/R1b come in as sample counts.
+            rej_count_reading = readings.get("rejection_count")
+            req_count_reading = readings.get("request_count")
+            rej_count = (rej_count_reading.value
+                         if rej_count_reading is not None and rej_count_reading.state == "ok"
+                         else None)
+            req_count = (req_count_reading.value
+                         if req_count_reading is not None and req_count_reading.state == "ok"
+                         else None)
+            proposal = triggers.evaluate(
+                flat_verdicts, rej_value, current, gates,
+                rejection_count=rej_count, request_count=req_count,
+            )
 
         # ---- est stage: post-clamp (R9) ----
         if proposal is None:
@@ -295,6 +308,64 @@ class ServiceView:
         )
 
     # ---------- internals ----------
+
+    @staticmethod
+    def _llm_verdicts(readings, cr_spec):
+        """Classify TTFT/OTPS readings against CR thresholds.
+
+        Returns (verdicts, missing_slo). Verdicts is
+        {"ttft": {kind: Verdict|None}, "otps": {kind: Verdict|None}}.
+        """
+        verdicts = {"ttft": {}, "otps": {}}
+        missing_slo = []
+        for signal in ("ttft", "otps"):
+            for kind, r in (readings.get(signal) or {}).items():
+                if r.state == "ok":
+                    thr = _threshold(cr_spec, signal, kind)
+                    verdicts[signal][kind] = classify(
+                        METRIC_DIRECTION[signal], r.value, thr, SLO_HEADROOM,
+                    )
+                elif r.state == "no_traffic":
+                    verdicts[signal][kind] = Verdict.COMFORTABLE
+                else:   # missing_series / unknown
+                    missing_slo.append(f"{signal}.{kind}:{r.state}")
+                    verdicts[signal][kind] = None
+        return verdicts, missing_slo
+
+    @staticmethod
+    def _job_verdicts(readings, cr_spec, physical):
+        """Classify queue depth (total ÷ live replicas) against maxDepth.
+
+        The CR's `queue.promql` returns the FLEET-TOTAL depth; `maxDepth`
+        is per-replica, so divide here. physical>0 is guaranteed by the
+        caller's no-stats guard; max() is belt-and-braces against races.
+
+        Returns (verdicts, missing_slo). Verdicts is
+        {"queue": {"depth": Verdict|None}} — the same shape the LLM path
+        emits so downstream (comfort streak, flat_verdicts, hold_reason)
+        behaves identically for both kinds.
+        """
+        verdicts = {"queue": {}}
+        missing_slo = []
+        r = readings.get("queue_depth")
+        max_depth = int((cr_spec.get("queue") or {}).get("maxDepth") or 0)
+        if r is None or max_depth <= 0:
+            missing_slo.append("queue.depth:unconfigured")
+            verdicts["queue"]["depth"] = None
+        elif r.state == "ok":
+            per_replica = r.value / max(physical, 1)
+            verdicts["queue"]["depth"] = classify(
+                METRIC_DIRECTION["queue"], per_replica, max_depth, SLO_HEADROOM,
+            )
+        elif r.state == "no_traffic":
+            # Queue empty (hist NaN) — deepest possible comfort. An
+            # `or vector(0)` PromQL reads as ok(0) above and lands
+            # COMFORTABLE through classify; the NaN form arrives here.
+            verdicts["queue"]["depth"] = Verdict.COMFORTABLE
+        else:
+            missing_slo.append(f"queue.depth:{r.state}")
+            verdicts["queue"]["depth"] = None
+        return verdicts, missing_slo
 
     def _transition(self, readings, verdicts, placement, physical, now,
                     gates, phase, proposal, est, want, hold_reason):

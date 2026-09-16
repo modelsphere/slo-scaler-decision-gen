@@ -51,7 +51,8 @@ def main():
         kube_config.load_kube_config()
         log.info("kubernetes: using local kubeconfig")
 
-    slo = SLOStore()
+    slo = SLOStore()                                    # llmslorequirements
+    slo_job = SLOStore(plural="jobslorequirements")     # jobslorequirements
     k8s = K8sState()
     signals = Signals(
         base_url=os.environ.get(
@@ -62,10 +63,12 @@ def main():
     )
     controller = Controller(
         slo=slo, k8s=k8s, signals=signals, tick_seconds=tick_seconds,
+        slo_job=slo_job,
     )
 
     try:
-        slo.start()             # bg CR watch thread
+        slo.start()             # bg CR watch thread (llm)
+        slo_job.start()         # bg CR watch thread (job)
         controller.start()      # bg ticker thread
         # ready gates /readyz (kube endpoints) and /decisions (direct hits)
         # on "controller has attempted a real tick" — serving the boot
@@ -74,6 +77,7 @@ def main():
     finally:
         controller.stop()
         slo.stop()
+        slo_job.stop()
         log.info("shutting down")
 
 

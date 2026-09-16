@@ -27,15 +27,18 @@ _BACKOFF_MAX = 60.0
 
 
 class SLOStore:
-    def __init__(self, api=None, watch_factory=None):
+    def __init__(self, plural=PLURAL, api=None, watch_factory=None):
         """Dependency-injectable for tests.
 
+        `plural`         CRD plural to watch. Default `llmslorequirements`;
+                         pass "jobslorequirements" for the JobSLO kind.
         `api`            kubernetes.client.CustomObjectsApi (constructed
                          on first start() if None).
         `watch_factory`  callable returning a kubernetes.watch.Watch
                          (or compatible). Tests pass a fake that yields
                          a scripted event sequence.
         """
+        self.plural = plural
         self._lock = threading.Lock()
         self._crs = {}   # (namespace, service_id) -> {spec dict, resource_version}
 
@@ -53,7 +56,7 @@ class SLOStore:
             return
         self._started = True
         self._thread = threading.Thread(
-            target=self._run, daemon=True, name="slo-store",
+            target=self._run, daemon=True, name=f"slo-store-{self.plural}",
         )
         self._thread.start()
 
@@ -122,7 +125,7 @@ class SLOStore:
         try:
             for event in w.stream(
                 api.list_cluster_custom_object,
-                GROUP, VERSION, PLURAL,
+                GROUP, VERSION, self.plural,
                 # Ask for a BOOKMARK after the initial list — that's the
                 # canonical "list complete" signal we set `_synced` on.
                 allow_watch_bookmarks=True,

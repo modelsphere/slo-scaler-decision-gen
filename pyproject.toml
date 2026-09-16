@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "decision-gen"
-version = "0.1.0"
+version = "0.5.0"
 description = "LLM inference scale-decision operator"
 requires-python = ">=3.10"
 dependencies = [

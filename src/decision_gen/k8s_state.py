@@ -12,6 +12,7 @@ limits; find pool affinity" so the downstream code is uniform.
 """
 
 import logging
+import os
 import time
 from dataclasses import dataclass
 
@@ -28,6 +29,8 @@ LWS_PLURAL = "leaderworkersets"
 GPU_LIMIT_KEY = "nvidia.com/gpu"
 GPU_PRODUCT_LABEL = "nvidia.com/gpu.product"
 GPU_PRESENT_LABEL = "nvidia.com/gpu.present"
+
+DEFAULT_GPU_POOL = os.environ.get("DEFAULT_GPU_POOL", "NVIDIA-H100-80GB-HBM3")
 
 # TEMP-REVERT — H800-as-H100 pool merge. To revoke: delete POOL_ALIASES
 # and the `_canonical_pool()` indirection below (revert to direct product
@@ -262,9 +265,21 @@ class K8sState:
         if max_gpus <= 0:
             return None  # filters sidecars (cart-*) with no GPU
 
+        # Pool decision:
+        #   AMBIGUOUS → refuse to guess (workload unmanageable this tick).
+        #   None      → no GPU-product pin; use v0 default. Note that a
+        #               workload with *other* node affinity (disk, zone,
+        #               hostname) but no GPU-product selector also lands
+        #               here — that's correct: the default is about GPU
+        #               booking, not about other constraints.
+        #   str       → the pinned pool.
         pool = self._extract_pool_from_affinity(spec.get("affinity"))
-        if pool is None:
+        if pool is K8sState.AMBIGUOUS:
             return None
+        if pool is None:
+            log.info("%s/%s: no GPU affinity; defaulting pool=%s",
+                     namespace, workload_name, DEFAULT_GPU_POOL)
+            pool = DEFAULT_GPU_POOL
         return Placement(
             namespace=namespace, name=workload_name, kind=kind,
             pool=pool, gpus_per_replica=max_gpus,
@@ -272,15 +287,28 @@ class K8sState:
             spec_replicas=spec_replicas,
         )
 
+    # Sentinel returned by _extract_pool_from_affinity when the workload
+    # pins to ≥2 distinct GPU pools after canonicalization — genuinely
+    # ambiguous, refuse to guess. Distinct from "no GPU-product pin",
+    # which falls through to DEFAULT_GPU_POOL.
+    AMBIGUOUS = object()
+
     @staticmethod
     def _extract_pool_from_affinity(affinity):
         """Pool = the single GPU-product value the workload pins to.
 
+        Returns:
+          pool name (str)      — one canonical pool after alias merge.
+          None                 — no GPU-product `In` selector found.
+                                 Callers treat this as "unconstrained";
+                                 default rules may apply.
+          K8sState.AMBIGUOUS   — GPU-product selector listed ≥2 canonical
+                                 pools. Callers must refuse to place.
+
         kubernetes-python's `.to_dict()` uses the *attribute* name
         (snake_case) for nested sub-objects, not the JSON key (camelCase).
         LWS custom objects come through as plain dicts — JSON keys. Accept
-        both. A missing or ambiguous pool returns None (workload is
-        unmanageable this tick).
+        both.
         """
         if not affinity:
             return None
@@ -308,7 +336,7 @@ class K8sState:
         canonical = {_canonical_pool(v) for v in values}
         if len(canonical) == 1:
             return canonical.pop()
-        return None
+        return K8sState.AMBIGUOUS
 
     # ---------- pool_capacity ----------
 

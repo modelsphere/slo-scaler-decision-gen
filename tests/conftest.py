@@ -13,8 +13,9 @@ from decision_gen.signals import Reading
 class FakeSLOStore:
     """Dict-backed SLO cache. Matches `slo_store.SLOStore.snapshot()`."""
 
-    def __init__(self, specs=None):
+    def __init__(self, specs=None, plural="llmslorequirements"):
         import threading
+        self.plural = plural
         self._specs = dict(specs or {})
         self._event = threading.Event()
         self._event.set()           # default: watch already has data
@@ -52,6 +53,8 @@ class FakeSignals:
         self.rejection_count_val = None
         self.request_count_val = None
         self.replicas_ready_val = None
+        self.queue_depth_overrides = {}    # {(ns, svc): value | Reading}
+        self.queue_depth_default = None    # fallback when no override
         self.calls = []
 
     def _wrap(self, v):
@@ -88,6 +91,22 @@ class FakeSignals:
     def replicas_ready(self, ns, svc):
         self.calls.append(("replicas_ready", ns, svc))
         return self._wrap(self.replicas_ready_val)
+
+    def queue_depth(self, ns, svc, promql):
+        self.calls.append(("queue_depth", ns, svc, promql))
+        v = self.queue_depth_overrides.get((ns, svc), self.queue_depth_default)
+        return self._wrap(v)
+
+    def job_replicas_ready(self, ns, deployment):
+        """Mirror signals.job_replicas_ready: jobs read physical via
+        kube-state-metrics, not the LLM bodylog series."""
+        self.calls.append(("job_replicas_ready", ns, deployment))
+        return self._wrap(self.replicas_ready_val)
+
+    def set_queue_depth(self, ns, svc, value):
+        """Value may be a number (ok), a `Reading` for custom state, or None
+        (missing_series)."""
+        self.queue_depth_overrides[(ns, svc)] = value
 
     def set_ttft(self, ns, svc, kind, value):
         self.ttft_fn[(ns, svc, kind)] = value
@@ -156,4 +175,20 @@ def cr_spec():
         "maximumDeployment": {"type": "replica", "value": 8},
         "ttft": {"default": {"metrics": [{"type": "p80", "threshold": 20.0}]}},
         "otps": {"default": {"metrics": [{"type": "p80", "threshold": 30.0}]}},
+    }
+
+
+@pytest.fixture
+def job_cr_spec():
+    """JobSLO shape: queue.maxDepth is the only SLO knob; promql is
+    passed through verbatim to signals.queue_depth()."""
+    return {
+        "serviceId": "svc",
+        "priority": 5,
+        "minimumDeployment": {"type": "replica", "value": 1},
+        "maximumDeployment": {"type": "replica", "value": 8},
+        "queue": {
+            "maxDepth": 5,
+            "promql": "sum(max by(status)(q{svc=\"svc\"})) or vector(0)",
+        },
     }

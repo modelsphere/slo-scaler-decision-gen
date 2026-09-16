@@ -187,6 +187,46 @@ def test_multi_pool_template_unmanageable():
     assert state.resolve_placement("kimi", "x") is None
 
 
+def test_no_affinity_defaults_to_h100():
+    """V0 default: no GPU-product pin anywhere → DEFAULT_GPU_POOL.
+    Covers pods like minimax-h3 that carry no affinity at all."""
+    deploy = {"spec": {"template": {"spec": {
+        "containers": [{"name": "m", "resources": {"limits": {"nvidia.com/gpu": 4}}}],
+    }}}}
+    apps, core, custom = _fake_apis(deploy=deploy)
+    state = K8sState(apps_v1=apps, core_v1=core, custom_v1=custom)
+    p = state.resolve_placement("ns", "svc")
+    assert p is not None and p.pool == POOL_H100
+    assert p.gpus_per_replica == 4
+
+
+def test_non_gpu_affinity_does_not_block_default():
+    """A pod with affinity for disk/zone/etc but no GPU pin must still
+    fall into the default rule — the extractor's `None` means
+    "unconstrained", not "ambiguous". Regression for the review finding:
+    the tri-state distinction is what keeps these workloads manageable."""
+    deploy = {"spec": {"template": {"spec": {
+        "affinity": {
+            "nodeAffinity": {
+                "requiredDuringSchedulingIgnoredDuringExecution": {
+                    "nodeSelectorTerms": [{
+                        "matchExpressions": [{
+                            "key": "kubernetes.io/hostname",
+                            "operator": "In",
+                            "values": ["node-a"],
+                        }],
+                    }],
+                },
+            },
+        },
+        "containers": [{"name": "m", "resources": {"limits": {"nvidia.com/gpu": 2}}}],
+    }}}}
+    apps, core, custom = _fake_apis(deploy=deploy)
+    state = K8sState(apps_v1=apps, core_v1=core, custom_v1=custom)
+    p = state.resolve_placement("ns", "svc")
+    assert p is not None and p.pool == POOL_H100
+
+
 def test_lws_leader_worker_pool_mismatch_unmanageable():
     lws = {
         "spec": {
