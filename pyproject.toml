@@ -4,9 +4,16 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "decision-gen"
-version = "0.5.0"
-description = "LLM inference scale-decision operator"
+version = "0.6.0"
+description = "Turns SLO requirements and live signals into replica decisions for LLM inference services"
+readme = "README.md"
+license = "Apache-2.0"
 requires-python = ">=3.10"
+keywords = ["kubernetes", "operator", "autoscaling", "llm", "slo"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Topic :: System :: Clustering",
+]
 dependencies = [
     "kubernetes>=28",
     "requests>=2.31",
@@ -17,6 +24,10 @@ dev = ["pytest>=8"]
 
 [project.scripts]
 decision-gen = "decision_gen.__main__:main"
+
+[project.urls]
+Homepage = "https://github.com/project-modelpilot/slo-scaler-decision-gen"
+Source = "https://github.com/project-modelpilot/slo-scaler-decision-gen"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

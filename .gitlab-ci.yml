@@ -1,0 +1,108 @@
+# 打 tag 自动 build slo-scaler-decision-gen 镜像并 push 到 harbor;每次 push 跑测试。
+#
+# 参考同组 autoconfig / llm-openresty 惯例:org 共享 `public-buildx` runner —— docker daemon
+# 已内置 harbor 鉴权,CI 里不需要 docker login、也不需要配 HARBOR_ 变量。
+#
+# ⚠️ 这个 runner 【不支持 job 级 image:】(实测 pipeline 421250 报 "shell not found";
+#    autoconfig 的四个 job 也都没用 image:)。而且它的 docker 是 socket 绑定,
+#    `docker run -v $PWD:...` 挂的是宿主机路径、不是 job 工作区。所以测试不另起容器跑,
+#    而是塞进一次 docker build —— 构建上下文是流式送进 daemon 的,不受上面两条限制。
+#
+# Dockerfile 的底座和 pip 源是 build arg,【默认值指向公网】(Docker Hub / PyPI),
+# 这样仓库开源后外部用户 `docker build .` 开箱即用;内网 CI 在这里覆盖回 harbor 与国内源。
+#
+# 触发:test 每次 push 都跑;build 仅打 tag。
+# 产物 harbor.4pd.io/hardcore-tech/llm-scaler-decision-gen:<tag>(+ :latest;预发布 tag 不推 latest)。
+#
+# tag 【不带 v 前缀】(0.5.1,不是 v0.5.1)。历史镜像 tag 带 v 是早期手工推的遗留;
+# Helm chart 的 version 本来就不允许前导 v(SemVer2),同组的 Go 仓(autoconfig /
+# hang-watcher / bodylog)也都不带。校验里仍然剥 v,老 tag 不至于突然报错。
+#
+# ⚠️ 镜像仓名沿用既有的 llm-scaler-decision-gen,【没有】跟着改成仓名:
+# config/manager/manager-unstable.yaml 就钉着它的 v0.5,改仓名会让 CI 推到一个没人引用的新仓。
+#
+# 生效前提:本文件要在【被打 tag 的 commit】上(先合进 main),再打 tag。
+# 预发布用后缀区分,如 0.5.1-rc1。
+
+stages: [test, build]
+
+variables:
+  IMAGE: harbor.4pd.io/hardcore-tech/llm-scaler-decision-gen
+  DOCKER_BUILDKIT: "0"
+  BASE_IMAGE: harbor.4pd.io/sagegpt-aio/pk_platform/ubuntu_python:24.04_3.12
+  PIP_INDEX_URL: https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
+
+  # 测试底座【故意】不用 BASE_IMAGE。这些 buildx runner 的旧 seccomp profile 挡
+  # clone3:glibc>=2.34(ubuntu 24.04 是 2.39)的 pthread_create 走 clone3,建线程
+  # 直接 EPERM。这套测试要起 watch / ticker / HTTP 三类线程,实测 17 个用例全挂在
+  # RuntimeError: can't start new thread(pipeline 421257 / 421260,后者还试过
+  # --ulimit nproc=8192 无效 —— 不是 ulimit 的事)。
+  # musl 的 pthread_create 走 clone,不受该 profile 影响,所以测试跑在 alpine 上。
+  # 发布镜像仍用 BASE_IMAGE,不受影响:它只在运行时起线程,那时已不在 runner 里。
+  TEST_IMAGE: harbor.4pd.io/hardcore-tech/python:3.12-alpine
+
+# 测试底座见上面 TEST_IMAGE 的说明(不是 BASE_IMAGE,原因是 runner 的 seccomp)。
+# 用一次性 Dockerfile 而不是 docker run:见文件头那条 runner 限制。
+# RUN pytest 失败 → build 失败 → job 失败,不需要额外判退出码。
+#
+# PIP_PROGRESS_BAR=off 是必须的:runner 容器线程数受限,pip 默认的 rich 进度条要另起
+# 刷新线程 → RuntimeError: can't start new thread,整个 pip 失败(实测 pipeline 421252;
+# cache-hit-sim 在 419495 踩过同一个)。本机 docker build 不复现,只在 runner 上炸。
+#
+# ⚠️ 必须用环境变量,命令行的 --progress-bar off 不够:装本项目会走 PEP 517 构建,
+# pip 会另起一个【嵌套 pip】装构建依赖,那个子进程不继承命令行参数、只继承环境
+# (实测 pipeline 421255 就挂在这一层)。
+test:
+  stage: test
+  tags: [public-buildx]
+  script:
+    - |
+      set -eu
+      docker build --no-cache -f - -t "decision-gen-ci-test:$CI_COMMIT_SHORT_SHA" . <<EOF
+      FROM $TEST_IMAGE
+      WORKDIR /src
+      COPY . .
+      ENV PIP_PROGRESS_BAR=off
+      RUN pip install --no-cache-dir -i $PIP_INDEX_URL ".[dev]"
+      RUN python3 -m pytest -q
+      EOF
+  after_script:
+    - docker rmi "decision-gen-ci-test:$CI_COMMIT_SHORT_SHA" >/dev/null 2>&1 || true
+
+build:image:
+  stage: build
+  tags: [public-buildx]
+  rules:
+    - if: '$CI_COMMIT_TAG'          # 只在打 tag 时构建;其它 push 不触发
+  before_script:
+    # PRERELEASE:tag 里带 "-"(SemVer 预发布,如 0.5.1-rc1)时非空。照 autoconfig 的写法。
+    - 'case "$CI_COMMIT_TAG" in *-*) PRERELEASE=1 ;; *) PRERELEASE= ;; esac'
+    - 'echo "tag=$CI_COMMIT_TAG prerelease=${PRERELEASE:-0}"'
+  script:
+    # tag 与 pyproject 的 version 必须一致,否则镜像里装的包版本和镜像 tag 对不上 ——
+    # 这正是别的仓踩过的漂移(cache_aware_router 的 Cargo.toml 停在 0.6.1 而镜像已是
+    # v0.6.4,启动日志自报错误版本)。预发布后缀在比对前剥掉:它标记的是「这一版的
+    # 第 n 次试发」,包版本仍是同一个。
+    - |
+      set -eu
+      # 用 sed 而不是 tomllib:runner 的 job 镜像(docker.4pd.io/build:12.0-buildx)
+      # 里 python < 3.11,没有 tomllib(实测 pipeline 421263)。version 在
+      # pyproject.toml 里是独占一行的字面量,sed 足够且没有额外依赖。
+      PKG_VER=$(sed -n 's/^version[[:space:]]*=[[:space:]]*"\(.*\)"$/\1/p' pyproject.toml | head -1)
+      if [ -z "$PKG_VER" ]; then echo "没能从 pyproject.toml 读出 version"; exit 1; fi
+      # tag 约定不带 v,但仍剥一次:仓里还有 v0.1…v0.5.1 那批历史 tag,
+      # 万一有人照旧习惯打 v0.5.2,不该在这里莫名其妙地失败。
+      TAG_VER="${CI_COMMIT_TAG#v}"
+      BASE_VER="${TAG_VER%%-*}"
+      if [ "$BASE_VER" != "$PKG_VER" ]; then
+        echo "tag ${CI_COMMIT_TAG}(版本部分 ${BASE_VER})与 pyproject.toml 的 version ${PKG_VER} 不一致"
+        exit 1
+      fi
+    - >
+      docker build
+      --build-arg "BASE_IMAGE=$BASE_IMAGE"
+      --build-arg "PIP_INDEX_URL=$PIP_INDEX_URL"
+      -t "$IMAGE:$CI_COMMIT_TAG" .
+    - docker push "$IMAGE:$CI_COMMIT_TAG"
+    # 预发布跳过 :latest —— RC 是拿去验证的,不该变成「没指定版本时默认拿到的那个」。
+    - if [ -z "$PRERELEASE" ]; then docker tag "$IMAGE:$CI_COMMIT_TAG" "$IMAGE:latest" && docker push "$IMAGE:latest"; fi
