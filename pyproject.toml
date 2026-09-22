@@ -26,8 +26,8 @@ dev = ["pytest>=8"]
 decision-gen = "decision_gen.__main__:main"
 
 [project.urls]
-Homepage = "https://github.com/project-modelpilot/slo-scaler-decision-gen"
-Source = "https://github.com/project-modelpilot/slo-scaler-decision-gen"
+Homepage = "https://github.com/modelsphere/slo-scaler-decision-gen"
+Source = "https://github.com/modelsphere/slo-scaler-decision-gen"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
