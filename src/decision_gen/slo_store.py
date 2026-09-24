@@ -18,7 +18,7 @@ from kubernetes import client, watch
 log = logging.getLogger(__name__)
 
 
-GROUP = "inference.x-k8s.io"
+GROUP = "inference.modelsphere.dev"
 VERSION = "v1alpha1"
 PLURAL = "llmslorequirements"
 

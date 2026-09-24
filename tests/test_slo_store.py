@@ -16,7 +16,7 @@ def _cr_event(etype, namespace, service_id, rv=1, extra_spec=None):
     return {
         "type": etype,
         "object": {
-            "apiVersion": "inference.x-k8s.io/v1alpha1",
+            "apiVersion": "inference.modelsphere.dev/v1alpha1",
             "kind": "LLMSLORequirement",
             "metadata": {
                 "name": service_id,

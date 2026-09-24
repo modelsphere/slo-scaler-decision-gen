@@ -14,7 +14,7 @@ kind: ClusterRole
 metadata:
   name: decision-gen
 rules:
-  - apiGroups: ["inference.x-k8s.io"]
+  - apiGroups: ["inference.modelsphere.dev"]
     resources: ["llmslorequirements"]
     verbs: ["get", "list", "watch"]
   - apiGroups: [""]

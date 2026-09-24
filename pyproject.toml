@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "decision-gen"
-version = "0.6.0"
+version = "0.7.0"
 description = "Turns SLO requirements and live signals into replica decisions for LLM inference services"
 readme = "README.md"
 license = "Apache-2.0"
