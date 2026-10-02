@@ -1,7 +1,4 @@
 # Run the test suite on every push to main and on every pull request.
-#
-# The internal GitLab pipeline (.gitlab-ci.yml) already runs these tests;
-# this workflow gives the public GitHub side the same signal on PRs.
 name: Test
 
 on:
