@@ -1,6 +1,5 @@
 # The base image is a build arg so that a build behind a registry mirror, or on
 # a runner that cannot reach Docker Hub, can point it at its own registry.
-# See .gitlab-ci.yml for how the internal CI overrides it.
 ARG BASE_IMAGE=python:3.12-slim
 
 FROM ${BASE_IMAGE}

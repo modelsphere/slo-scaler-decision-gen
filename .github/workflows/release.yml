@@ -1,13 +1,10 @@
 # Public release: a version tag builds the image and pushes it to Docker Hub.
 #
-# The internal image is built separately by .gitlab-ci.yml and goes to harbor.
-# Both build the same Dockerfile; only the base-image build args and the
-# destination registry differ. Every base here already defaults to a public
-# image, so this side passes no overrides.
+# The Dockerfile's base image defaults to a public one, so no build args are
+# passed here.
 #
-# Image name follows the internal one (llm-scaler-decision-gen), which is
-      # what the slo-decision-gen chart already points at -- it does not match
-      # the repo name.
+# The image is named llm-scaler-decision-gen, which is what the
+# slo-decision-gen chart already points at -- it does not match the repo name.
 #
 # Credentials come from the organisation secrets DOCKERHUB_USERNAME and
 # DOCKERHUB_TOKEN.
