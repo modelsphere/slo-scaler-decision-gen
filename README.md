@@ -64,8 +64,10 @@ kubectl apply -f config/manager/manager.yaml
 ```
 
 The manifests assume a `llm-scaler` namespace and an image you have built and
-pushed yourself (`make docker`). RBAC is read-only apart from the CR watches:
-this process never writes to the cluster.
+pushed yourself (`make docker`). Released images are also published to Docker
+Hub as `4pdosc/llm-scaler-decision-gen:<version>`; set that as the `image:` in
+`config/manager/manager.yaml` to skip the build. RBAC is read-only apart from
+the CR watches: this process never writes to the cluster.
 
 ## HTTP surface
 
