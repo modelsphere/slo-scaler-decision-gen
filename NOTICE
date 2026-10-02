@@ -1,0 +1,17 @@
+slo-scaler-decision-gen
+Copyright (c) 2026 the ModelSphere authors
+
+Licensed under the Apache License, Version 2.0. See LICENSE.
+
+This product uses software developed by third parties. Their licenses apply
+to their own code, not to this project's.
+
+Python dependencies (installed into the image)
+  Kubernetes Python client (kubernetes) ... Apache-2.0
+  Requests (requests) ..................... Apache-2.0
+  Their own dependencies (urllib3, certifi, PyYAML and others) are installed
+  alongside them, each under its own license as recorded in its package
+  metadata.
+
+Container base image
+  docker.io/library/python:3.12-slim — see the image's own licenses.
