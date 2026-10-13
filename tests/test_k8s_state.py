@@ -66,8 +66,12 @@ class _Api404(Exception):
         self.status = 404
 
 
-def _fake_apis(*, lws=None, sts=None, deploy=None, nodes=None, pods=None):
-    """Build a (apps, core, custom) triple; missing workloads raise ApiException(404)."""
+def _fake_apis(*, lws=None, sts=None, deploy=None, ds=None, nodes=None, pods=None):
+    """Build a (apps, core, custom) triple; missing workloads raise ApiException(404).
+
+    Both LWS and DS resolve through CustomObjectsApi; dispatch by plural so
+    a test can provide one, both, or neither.
+    """
     apps = MagicMock()
     if sts is None:
         apps.read_namespaced_stateful_set.side_effect = _Api404()
@@ -83,10 +87,17 @@ def _fake_apis(*, lws=None, sts=None, deploy=None, nodes=None, pods=None):
     core.list_pod_for_all_namespaces.return_value = SimpleNamespace(items=pods or [])
 
     custom = MagicMock()
-    if lws is None:
-        custom.get_namespaced_custom_object.side_effect = _Api404()
-    else:
-        custom.get_namespaced_custom_object.return_value = lws
+    by_plural = {}
+    if lws is not None:
+        by_plural[k8s_state.LWS_PLURAL] = lws
+    if ds is not None:
+        by_plural[k8s_state.DS_PLURAL] = ds
+
+    def _get(group, version, namespace, plural, name):
+        if plural in by_plural:
+            return by_plural[plural]
+        raise _Api404()
+    custom.get_namespaced_custom_object.side_effect = _get
     return apps, core, custom
 
 
@@ -295,6 +306,321 @@ def test_deployment_pool_from_affinity_snake_case():
     assert p is not None
     assert p.pool == POOL_H100
     assert p.gpus_per_replica == 2
+
+
+# ---------- PD shapes (colocate Deployment + DisaggregatedSet bundle) ----------
+
+def _colocate_pod_template(gpus_per_engine=4, pool=POOL_H100):
+    """Colocate shape: prefill + decode + router in ONE pod.
+
+    Each engine container requests `gpus_per_engine`; router requests none.
+    Mirrors `sglang-qwen36-colocate` — scheduler sees a single pod that
+    occupies 2×gpus_per_engine GPUs via sum-of-containers accounting.
+    """
+    return {
+        "spec": {
+            "affinity": _affinity_with_pool(pool),
+            "containers": [
+                {"name": "prefill",
+                 "resources": {"limits": {"nvidia.com/gpu": gpus_per_engine}}},
+                {"name": "decode",
+                 "resources": {"limits": {"nvidia.com/gpu": gpus_per_engine}}},
+                {"name": "router",
+                 "resources": {"limits": {}}},
+            ],
+        },
+    }
+
+
+def _ds_spec(*, slices=1, roles, per_pod_gpus=8, pool=POOL_H100):
+    """Generic DS builder. `roles` is a list of (name, replicas, lwt_size)."""
+    role_objs = []
+    for name, replicas, lwt_size in roles:
+        role_objs.append({
+            "name": name,
+            "spec": {
+                "replicas": replicas,
+                "leaderWorkerTemplate": {
+                    "size": lwt_size,
+                    "leaderTemplate": _pod_template(gpu_limit=per_pod_gpus, pool=pool),
+                    "workerTemplate": _pod_template(gpu_limit=per_pod_gpus, pool=pool),
+                },
+            },
+        })
+    return {"spec": {"slices": slices, "roles": role_objs}}
+
+
+def _ds_2p1d_spec(per_pod_gpus=8, pool=POOL_H100, slices=1):
+    """2P1D DisaggregatedSet shape — mirrors `vllm-qwen36-2p1d` in test-dsset.
+    Live DS has slices=1; the bundle knob turns this into N × 2P1D."""
+    return _ds_spec(
+        slices=slices,
+        per_pod_gpus=per_pod_gpus, pool=pool,
+        roles=[("prefill", 2, 1), ("decode", 1, 1)],
+    )
+
+
+def _ds_1p1d_spec(per_pod_gpus=8, pool=POOL_H100, slices=1):
+    return _ds_spec(
+        slices=slices,
+        per_pod_gpus=per_pod_gpus, pool=pool,
+        roles=[("prefill", 1, 1), ("decode", 1, 1)],
+    )
+
+
+def _ds_2p3d_spec(per_pod_gpus=8, pool=POOL_H100, slices=1):
+    return _ds_spec(
+        slices=slices,
+        per_pod_gpus=per_pod_gpus, pool=pool,
+        roles=[("prefill", 2, 1), ("decode", 3, 1)],
+    )
+
+
+def test_colocate_deployment_sums_container_gpus():
+    """Shape C: ONE Deployment, 3 containers each owning a slice of the 8 GPUs.
+    Sum-of-containers must equal scheduler-admission-total (8), not max (4).
+    Regression: previous max() accounting made a colocate pod look half price,
+    which would let the allocator oversubscribe the pool."""
+    deploy = {"spec": {"template": _colocate_pod_template(gpus_per_engine=4)}}
+    apps, core, custom = _fake_apis(deploy=deploy)
+    state = K8sState(apps_v1=apps, core_v1=core, custom_v1=custom)
+    p = state.resolve_placement("test-dsset", "sglang-qwen36-colocate")
+    assert p is not None
+    assert p.kind == "deployment"
+    assert p.gpus_per_replica == 8     # 4 (prefill) + 4 (decode) + 0 (router)
+
+
+def test_ds_2p1d_bundle_gpus_and_replicas():
+    """Shape I live today: DS slices=1, prefill.replicas=2, decode.replicas=1
+    → ONE bundle of 2 prefill pods + 1 decode pod = 24 GPUs.
+    Bundle knob is `spec.slices` (=1 here), NOT any role's replicas."""
+    ds = _ds_2p1d_spec(per_pod_gpus=8)
+    apps, core, custom = _fake_apis(ds=ds)
+    state = K8sState(apps_v1=apps, core_v1=core, custom_v1=custom)
+    p = state.resolve_placement("test-dsset", "vllm-qwen36-2p1d")
+    assert p is not None
+    assert p.kind == "disaggregatedset"
+    assert p.workload_name == "vllm-qwen36-2p1d"
+    assert p.gpus_per_replica == 24    # per-bundle cost: 2×8 + 1×8
+    assert p.spec_replicas == 1        # slices (not role replicas) is the knob
+    assert p.members == (
+        ("lws", "vllm-qwen36-2p1d-prefill"),
+        ("lws", "vllm-qwen36-2p1d-decode"),
+    )
+
+
+def test_ds_2p1d_slices_5_is_five_bundles():
+    """5 × 2p3d-style scaling: slices is the bundle count. Per-bundle cost
+    is unchanged (gpus_per_replica is per-slice); the planner multiplies
+    slices × per-bundle-cost to get the total."""
+    ds = _ds_2p1d_spec(per_pod_gpus=8, slices=5)
+    apps, core, custom = _fake_apis(ds=ds)
+    state = K8sState(apps_v1=apps, core_v1=core, custom_v1=custom)
+    p = state.resolve_placement("test-dsset", "vllm-qwen36-2p1d")
+    assert p is not None
+    assert p.gpus_per_replica == 24    # unchanged: per-slice cost
+    assert p.spec_replicas == 5        # 5 slices → planner sees "5 bundles"
+
+
+def test_ds_1p1d_bundle():
+    ds = _ds_1p1d_spec(per_pod_gpus=8)
+    apps, core, custom = _fake_apis(ds=ds)
+    state = K8sState(apps_v1=apps, core_v1=core, custom_v1=custom)
+    p = state.resolve_placement("test-dsset", "vllm-qwen36-1p1d")
+    assert p is not None
+    assert p.kind == "disaggregatedset"
+    assert p.gpus_per_replica == 16    # 1×8 + 1×8
+    assert p.spec_replicas == 1
+
+
+def test_ds_2p3d_asymmetric_ratio():
+    """2P3D: prefill.replicas=2, decode.replicas=3. Per-bundle cost is
+    2×8 prefill + 3×8 decode = 40 GPUs. spec_replicas still = slices."""
+    ds = _ds_2p3d_spec(per_pod_gpus=8)
+    apps, core, custom = _fake_apis(ds=ds)
+    state = K8sState(apps_v1=apps, core_v1=core, custom_v1=custom)
+    p = state.resolve_placement("test-dsset", "vllm-qwen36-2p3d")
+    assert p is not None
+    assert p.kind == "disaggregatedset"
+    assert p.gpus_per_replica == 40    # 2×8 + 3×8
+    assert p.spec_replicas == 1
+
+
+def test_ds_role_with_lws_size_4_is_group_of_pods():
+    """lwt.size=4 → each LWS group spans 4 pods (e.g. TP32 across pods).
+    1 prefill group of size 4 × 8 GPU/pod = 32 GPUs just for prefill.
+    Bundle = 1 prefill group (32) + 1 decode group (32) = 64 GPUs."""
+    ds = _ds_spec(
+        slices=1, per_pod_gpus=8, pool=POOL_H100,
+        roles=[("prefill", 1, 4), ("decode", 1, 4)],
+    )
+    apps, core, custom = _fake_apis(ds=ds)
+    state = K8sState(apps_v1=apps, core_v1=core, custom_v1=custom)
+    p = state.resolve_placement("test-dsset", "vllm-tp32")
+    assert p is not None
+    assert p.gpus_per_replica == 64    # 1×4×8 + 1×4×8
+    assert p.spec_replicas == 1
+
+
+def test_ds_5x_2p3d_with_tp16_across_2_pods():
+    """Composition of slices × replicas × size, all three multiplied:
+    slices=5 bundles, 2P3D ratio, each role's LWS group spans 2 pods.
+    Per-bundle: 2×(2×8) prefill + 3×(2×8) decode = 32+48 = 80 GPUs.
+    Total footprint on cluster = 5 × 80 = 400 GPUs (planner's job)."""
+    ds = _ds_spec(
+        slices=5, per_pod_gpus=8, pool=POOL_H100,
+        roles=[("prefill", 2, 2), ("decode", 3, 2)],
+    )
+    apps, core, custom = _fake_apis(ds=ds)
+    state = K8sState(apps_v1=apps, core_v1=core, custom_v1=custom)
+    p = state.resolve_placement("test-dsset", "vllm-5x2p3d-tp16")
+    assert p is not None
+    assert p.gpus_per_replica == 80    # per-bundle
+    assert p.spec_replicas == 5        # slices
+
+
+def test_ds_missing_falls_through_to_deployment_unchanged():
+    """No DS, no LWS, no STS — Deployment branch is byte-for-byte unchanged."""
+    deploy = {"spec": {"template": _pod_template(gpu_limit=2)}}
+    apps, core, custom = _fake_apis(deploy=deploy)
+    state = K8sState(apps_v1=apps, core_v1=core, custom_v1=custom)
+    p = state.resolve_placement("ns", "plain-deployment")
+    assert p is not None
+    assert p.kind == "deployment"
+    assert p.gpus_per_replica == 2
+    # DS was actually looked up first (and missed) before falling through.
+    plurals_checked = [
+        c.args[3] for c in custom.get_namespaced_custom_object.call_args_list
+    ]
+    assert k8s_state.DS_PLURAL in plurals_checked
+    assert k8s_state.LWS_PLURAL in plurals_checked
+
+
+def test_ds_malformed_does_not_fall_through():
+    """DS exists but is broken (empty roles) → unmanageable, no silent fallback.
+    A silent fall-through to a same-named LWS would mis-price the bundle."""
+    ds = {"spec": {"slices": 1, "roles": []}}
+    apps, core, custom = _fake_apis(ds=ds)
+    state = K8sState(apps_v1=apps, core_v1=core, custom_v1=custom)
+    assert state.resolve_placement("test-dsset", "vllm-qwen36-2p1d") is None
+
+
+def test_ds_role_pool_mismatch_unmanageable():
+    ds = {
+        "spec": {
+            "slices": 1,
+            "roles": [
+                {"name": "prefill", "spec": {
+                    "replicas": 1,
+                    "leaderWorkerTemplate": {
+                        "size": 1,
+                        "leaderTemplate": _pod_template(gpu_limit=8, pool=POOL_H100),
+                        "workerTemplate": _pod_template(gpu_limit=8, pool=POOL_H100),
+                    },
+                }},
+                {"name": "decode", "spec": {
+                    "replicas": 1,
+                    "leaderWorkerTemplate": {
+                        "size": 1,
+                        "leaderTemplate": _pod_template(gpu_limit=8, pool=POOL_A100),
+                        "workerTemplate": _pod_template(gpu_limit=8, pool=POOL_A100),
+                    },
+                }},
+            ],
+        },
+    }
+    apps, core, custom = _fake_apis(ds=ds)
+    state = K8sState(apps_v1=apps, core_v1=core, custom_v1=custom)
+    assert state.resolve_placement("test-dsset", "vllm-qwen36-x") is None
+
+
+def _cpu_only_pod_template():
+    """A role pod that requests no GPUs (e.g. a CPU router folded into the DS)."""
+    return {
+        "spec": {
+            "containers": [
+                {"name": "router", "resources": {"limits": {}}},
+            ],
+        },
+    }
+
+
+def test_ds_with_cpu_router_role_contributes_zero():
+    """Forward-compat: if a DS grows a CPU-only router role (CRD allows it;
+    chart may someday fold the router Deployment into a 3rd role), the
+    role contributes 0 GPUs and the bundle remains a valid placement.
+    Today: bundle = 2P + 1D + 1 router = 24 GPUs (router free)."""
+    ds = {
+        "spec": {
+            "slices": 1,
+            "roles": [
+                {"name": "prefill", "spec": {
+                    "replicas": 2,
+                    "leaderWorkerTemplate": {
+                        "size": 1,
+                        "leaderTemplate": _pod_template(gpu_limit=8, pool=POOL_H100),
+                        "workerTemplate": _pod_template(gpu_limit=8, pool=POOL_H100),
+                    },
+                }},
+                {"name": "decode", "spec": {
+                    "replicas": 1,
+                    "leaderWorkerTemplate": {
+                        "size": 1,
+                        "leaderTemplate": _pod_template(gpu_limit=8, pool=POOL_H100),
+                        "workerTemplate": _pod_template(gpu_limit=8, pool=POOL_H100),
+                    },
+                }},
+                {"name": "router", "spec": {
+                    "replicas": 1,
+                    "leaderWorkerTemplate": {
+                        "size": 1,
+                        "leaderTemplate": _cpu_only_pod_template(),
+                        "workerTemplate": _cpu_only_pod_template(),
+                    },
+                }},
+            ],
+        },
+    }
+    apps, core, custom = _fake_apis(ds=ds)
+    state = K8sState(apps_v1=apps, core_v1=core, custom_v1=custom)
+    p = state.resolve_placement("test-dsset", "vllm-qwen36-2p1d")
+    assert p is not None
+    assert p.gpus_per_replica == 24   # router contributes 0
+    assert p.spec_replicas == 1
+    # Router role is surfaced in members for tracing even though it's free.
+    assert ("lws", "vllm-qwen36-2p1d-router") in p.members
+
+
+def test_ds_all_cpu_roles_unmanageable():
+    """A DS where every role is GPU-less has no pool consumption to ledger."""
+    ds = {
+        "spec": {
+            "slices": 1,
+            "roles": [
+                {"name": "router", "spec": {
+                    "replicas": 1,
+                    "leaderWorkerTemplate": {
+                        "size": 1,
+                        "leaderTemplate": _cpu_only_pod_template(),
+                        "workerTemplate": _cpu_only_pod_template(),
+                    },
+                }},
+            ],
+        },
+    }
+    apps, core, custom = _fake_apis(ds=ds)
+    state = K8sState(apps_v1=apps, core_v1=core, custom_v1=custom)
+    assert state.resolve_placement("test-dsset", "cpu-only-ds") is None
+
+
+def test_placement_member_workloads_default_back_compat():
+    """Non-DS placements expose ((kind, workload_name),) via member_workloads();
+    planner / controller don't need to special-case DS bundles."""
+    deploy = {"spec": {"template": _pod_template(gpu_limit=2)}}
+    apps, core, custom = _fake_apis(deploy=deploy)
+    state = K8sState(apps_v1=apps, core_v1=core, custom_v1=custom)
+    p = state.resolve_placement("ns", "plain")
+    assert p.member_workloads() == (("deployment", "plain"),)
 
 
 # ---------- pool_capacity ----------

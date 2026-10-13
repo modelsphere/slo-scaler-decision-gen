@@ -26,6 +26,13 @@ LWS_GROUP = "leaderworkerset.x-k8s.io"
 LWS_VERSION = "v1"
 LWS_PLURAL = "leaderworkersets"
 
+# DisaggregatedSet (PD-disagg bundles). The `ds` shortname on the cluster
+# currently resolves to disaggregatedsetrolescalers, so all client calls
+# must use the full plural here.
+DS_GROUP = "disaggregatedset.x-k8s.io"
+DS_VERSION = "v1"
+DS_PLURAL = "disaggregatedsets"
+
 GPU_LIMIT_KEY = "nvidia.com/gpu"
 GPU_PRODUCT_LABEL = "nvidia.com/gpu.product"
 GPU_PRESENT_LABEL = "nvidia.com/gpu.present"
@@ -53,11 +60,22 @@ class Placement:
     """Per-service contract read from its workload template."""
     namespace: str
     name: str
-    kind: str                # "deployment" | "statefulset" | "lws"
+    kind: str                # "deployment" | "statefulset" | "lws" | "disaggregatedset"
     pool: str
     gpus_per_replica: int
     workload_name: str = ""  # actual workload name (after alias)
     spec_replicas: int = 0   # declared replicas on the workload spec
+    # Member workloads composing this placement — used for log tracing.
+    # Empty means "single workload" — consumers see it as ((kind, workload_name),).
+    # DisaggregatedSet bundles pass the per-role LWS list explicitly.
+    members: tuple = ()
+
+    def member_workloads(self):
+        """Return the (kind, name) tuple list. Defaults to the single-workload
+        identity for non-DS placements."""
+        if self.members:
+            return self.members
+        return ((self.kind, self.workload_name or self.name),)
 
 
 def _to_dict(obj):
@@ -112,9 +130,25 @@ class K8sState:
     def resolve_placement(self, namespace, service_id):
         """Return Placement or None if the service is unmanageable this tick.
 
-        Order: alias → LWS → StatefulSet → Deployment.
+        Order: alias → DisaggregatedSet → LWS → StatefulSet → Deployment.
         """
         target_name = self.WORKLOAD_ALIASES.get((namespace, service_id), service_id)
+
+        # 0. DisaggregatedSet (PD-disagg bundle; disaggregatedset.x-k8s.io/v1)
+        ds = self._try_get_ds(namespace, target_name)
+        if ds is not None:
+            placement = self._placement_from_ds(namespace, target_name, ds)
+            if placement is not None:
+                log.info("%s/%s: ds pool=%s gpr=%d spec_replicas=%d",
+                          namespace, service_id, placement.pool,
+                          placement.gpus_per_replica, placement.spec_replicas)
+                return placement
+            # DS exists but malformed → unmanageable; do not fall through
+            log.warning(
+                "DisaggregatedSet %s/%s exists but malformed; service %s unmanageable this tick",
+                namespace, target_name, service_id,
+            )
+            return None
 
         # 1. LWS (dict-based; leaderworkerset.x-k8s.io/v1)
         lws = self._try_get_lws(namespace, target_name)
@@ -187,6 +221,16 @@ class K8sState:
                 return None
             raise
 
+    def _try_get_ds(self, namespace, name):
+        try:
+            return self._custom_api().get_namespaced_custom_object(
+                DS_GROUP, DS_VERSION, namespace, DS_PLURAL, name,
+            )
+        except ApiException as e:
+            if e.status == 404:
+                return None
+            raise
+
     def _try_get_sts(self, namespace, name):
         try:
             return self._apps_api().read_namespaced_stateful_set(name, namespace)
@@ -204,6 +248,110 @@ class K8sState:
             raise
 
     # ---------- placement extraction ----------
+
+    def _placement_from_ds(self, namespace, ds_name, ds_obj):
+        """DisaggregatedSet (PD-disagg bundle).
+
+        A DS "replica" = one slice = a bundle of
+          (P prefill LWS groups × lwt.size pods each)
+        + (D decode  LWS groups × lwt.size pods each)
+        + optional CPU-only roles (router), which contribute 0 GPUs.
+
+        Per-bundle GPU cost (gpus_per_replica):
+          Σ over GPU-requesting roles of
+            role.spec.replicas × leaderWorkerTemplate.size × per_pod_gpus.
+
+        The bundle knob is `spec.slices` — scaling the service means
+        bumping slices. Per-role `replicas` is the P:D ratio inside one
+        slice. (Verified on live `vllm-qwen36-2p1d` in test-dsset: slices=1,
+        prefill.replicas=2 spawn single LWS `…-0-…-prefill` with replicas=2.)
+        spec_replicas therefore reads slices, NOT any role's replicas.
+        """
+        spec = ds_obj.get("spec", {}) or {}
+        slices = int(spec.get("slices", 1))
+        roles = spec.get("roles", []) or []
+        if not roles:
+            log.warning("DS %s/%s has empty spec.roles; unmanageable",
+                        namespace, ds_name)
+            return None
+
+        pools = set()
+        gpus_per_slice = 0
+        members = []
+        for role in roles:
+            role_name = role.get("name", "") or ""
+            role_spec = role.get("spec", {}) or {}
+            role_replicas = int(role_spec.get("replicas", 1))
+            lwt = role_spec.get("leaderWorkerTemplate", {}) or {}
+            lwt_size = int(lwt.get("size", 1))
+            leader_tmpl = lwt.get("leaderTemplate", {}) or {}
+            worker_tmpl = lwt.get("workerTemplate", {}) or {}
+
+            leader_place = self._placement_from_pod_template(
+                namespace, ds_name, "lws",
+                {"spec": leader_tmpl.get("spec", {})},
+            )
+            worker_place = self._placement_from_pod_template(
+                namespace, ds_name, "lws",
+                {"spec": worker_tmpl.get("spec", {})},
+            )
+            # Zero-GPU role (a CPU router folded into the DS) is legitimate:
+            # contributes 0 to the GPU pool and should not make the DS
+            # unmanageable. Bail only on genuinely malformed templates
+            # (missing containers, ambiguous pool) — both come back None
+            # with a specific log already emitted downstream.
+            if leader_place is None and worker_place is None:
+                members.append(("lws", f"{ds_name}-{role_name}"))
+                continue
+            if leader_place is None or worker_place is None:
+                log.warning(
+                    "DS %s/%s role=%s: only one of leader/worker templates is GPU-less; unmanageable",
+                    namespace, ds_name, role_name,
+                )
+                return None
+            if leader_place.pool != worker_place.pool:
+                log.warning(
+                    "DS %s/%s role=%s leader/worker pools disagree (%s vs %s)",
+                    namespace, ds_name, role_name,
+                    leader_place.pool, worker_place.pool,
+                )
+                return None
+            if leader_place.gpus_per_replica != worker_place.gpus_per_replica:
+                log.warning(
+                    "DS %s/%s role=%s leader/worker gpus_per_pod differ (%d vs %d)",
+                    namespace, ds_name, role_name,
+                    leader_place.gpus_per_replica, worker_place.gpus_per_replica,
+                )
+                return None
+
+            pools.add(leader_place.pool)
+            per_group = lwt_size * leader_place.gpus_per_replica
+            gpus_per_slice += role_replicas * per_group
+            members.append(("lws", f"{ds_name}-{role_name}"))
+
+        if len(pools) != 1:
+            log.warning(
+                "DS %s/%s roles span multiple pools %s; unmanageable",
+                namespace, ds_name, sorted(pools),
+            )
+            return None
+        if gpus_per_slice <= 0:
+            # All roles were CPU-only (e.g. only-router DS) — no GPU pool
+            # consumption to ledger. Mirror the "filters sidecars" rule in
+            # _placement_from_pod_template and refuse to manage.
+            log.warning("DS %s/%s has no GPU-requesting roles; unmanageable",
+                        namespace, ds_name)
+            return None
+        pool = next(iter(pools))
+
+        return Placement(
+            namespace=namespace, name=ds_name, kind="disaggregatedset",
+            pool=pool,
+            gpus_per_replica=gpus_per_slice,
+            workload_name=ds_name,
+            spec_replicas=slices,
+            members=tuple(members),
+        )
 
     def _placement_from_lws(self, namespace, workload_name, lws_obj):
         """LWS: gpus_per_replica = leaderWorkerTemplate.size × per-pod GPUs."""
@@ -252,7 +400,11 @@ class K8sState:
         containers = spec.get("containers", []) or []
         if not containers:
             return None
-        max_gpus = 0
+        # Sum the per-container GPU limits to get pod-level accounting.
+        # Colocate (P+D engines in one pod) splits GPUs across engine
+        # containers — max() would undercount; sum() matches the pod's
+        # scheduler-admission total. Sidecars with no GPU limit contribute 0.
+        total_gpus = 0
         for c in containers:
             limits = ((c.get("resources") or {}).get("limits")) or {}
             v = limits.get(GPU_LIMIT_KEY, 0)
@@ -260,9 +412,8 @@ class K8sState:
                 v = int(v)
             except (TypeError, ValueError):
                 v = 0
-            if v > max_gpus:
-                max_gpus = v
-        if max_gpus <= 0:
+            total_gpus += v
+        if total_gpus <= 0:
             return None  # filters sidecars (cart-*) with no GPU
 
         # Pool decision:
@@ -282,7 +433,7 @@ class K8sState:
             pool = DEFAULT_GPU_POOL
         return Placement(
             namespace=namespace, name=workload_name, kind=kind,
-            pool=pool, gpus_per_replica=max_gpus,
+            pool=pool, gpus_per_replica=total_gpus,
             workload_name=workload_name,
             spec_replicas=spec_replicas,
         )
