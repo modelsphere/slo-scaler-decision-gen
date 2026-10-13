@@ -21,8 +21,9 @@ no `v` prefix; each tag publishes the image
   cost summed over roles (`role.replicas × leaderWorkerTemplate.size ×
   per-pod GPUs`). CPU-only roles (e.g. a router folded into the DS)
   contribute zero. The new `Placement.members` field lists the member
-  workloads for log tracing.
-- RBAC: read access on `disaggregatedsets.disaggregatedset.x-k8s.io`.
+  workloads for log tracing. Reading the DS requires `get/list/watch` on
+  `disaggregatedsets.disaggregatedset.x-k8s.io` — RBAC is owned by the
+  deployment chart.
 
 ### Changed
 - GitHub Actions pinned to commit SHAs.
@@ -37,6 +38,10 @@ no `v` prefix; each tag publishes the image
 - The internal GitLab pipeline (`.gitlab-ci.yml`).
 - `config/manager/manager-unstable.yaml`, an internal canary deployment that
   pulled from an internal registry. `config/manager/manager.yaml` is unchanged.
+- The whole `config/` directory (`rbac/rbac.yaml` and `manager/manager.yaml`).
+  The ClusterRole and Deployment are owned by the deployment Helm chart;
+  the in-repo copies had drifted out of sync and an `kubectl apply` against
+  them would silently revert chart-managed RBAC.
 
 ## [0.7.0] - 2026-09-25
 
