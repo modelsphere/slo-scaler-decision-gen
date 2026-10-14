@@ -283,3 +283,19 @@ def test_gap_defaults_to_zero_when_pool_missing():
 
 def test_no_services_returns_empty():
     assert resolve(wants={}, current={}, placement={}, cr={}, gap={}) == {}
+
+
+# ---------- PD bundle pricing ----------
+
+def test_pd_2p1d_bundle_gap_math():
+    """H100 pool of 32 GPUs, one 2P1D DS service (24 GPU/bundle).
+    One bundle fits, second does not — allocator must not oversubscribe."""
+    alloc = resolve(
+        wants={"vllm-qwen36-2p1d": 2},
+        current={"vllm-qwen36-2p1d": 0},
+        placement={"vllm-qwen36-2p1d": (POOL_H100, 24)},
+        cr={"vllm-qwen36-2p1d": _cr(min_v=0, max_v=10)},
+        gap={POOL_H100: 32},
+    )
+    # First bundle costs 24, leaves 8; second needs 24 more, doesn't fit.
+    assert alloc == {"vllm-qwen36-2p1d": 1}
