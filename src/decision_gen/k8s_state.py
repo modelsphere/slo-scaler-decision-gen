@@ -139,9 +139,10 @@ class K8sState:
         if ds is not None:
             placement = self._placement_from_ds(namespace, target_name, ds)
             if placement is not None:
-                log.info("%s/%s: ds pool=%s gpr=%d spec_replicas=%d",
+                log.info("%s/%s: ds pool=%s gpr=%d spec_replicas=%d members=%s",
                           namespace, service_id, placement.pool,
-                          placement.gpus_per_replica, placement.spec_replicas)
+                          placement.gpus_per_replica, placement.spec_replicas,
+                          placement.members)
                 return placement
             # DS exists but malformed → unmanageable; do not fall through
             log.warning(
@@ -229,6 +230,18 @@ class K8sState:
         except ApiException as e:
             if e.status == 404:
                 return None
+            if e.status == 403:
+                # Missing ClusterRole rule for disaggregatedsets. Fall through
+                # to LWS/STS/Deploy so only this service is unmanaged; raising
+                # would freeze every service's decision this tick. Call out
+                # the fix explicitly — the follow-up log ("no workload found")
+                # does not hint at RBAC.
+                log.warning(
+                    "forbidden reading DS %s/%s (rule %s %s): treating as absent; "
+                    "falling back to LWS/STS/Deploy. Grant get/list/watch on %s to fix",
+                    namespace, name, DS_GROUP, DS_PLURAL, DS_PLURAL + "." + DS_GROUP,
+                )
+                return None
             raise
 
     def _try_get_sts(self, namespace, name):
@@ -268,7 +281,14 @@ class K8sState:
         spec_replicas therefore reads slices, NOT any role's replicas.
         """
         spec = ds_obj.get("spec", {}) or {}
-        slices = int(spec.get("slices", 1))
+        # None-safe int: spec field defaulted by CRD can still be null if a
+        # test fixture or hand-edited object omits it; int(None) TypeErrors
+        # and aborts the whole tick.
+        def _int(d, key, default):
+            v = d.get(key)
+            return default if v is None else int(v)
+
+        slices = _int(spec, "slices", 1)
         roles = spec.get("roles", []) or []
         if not roles:
             log.warning("DS %s/%s has empty spec.roles; unmanageable",
@@ -281,9 +301,9 @@ class K8sState:
         for role in roles:
             role_name = role.get("name", "") or ""
             role_spec = role.get("spec", {}) or {}
-            role_replicas = int(role_spec.get("replicas", 1))
+            role_replicas = _int(role_spec, "replicas", 1)
             lwt = role_spec.get("leaderWorkerTemplate", {}) or {}
-            lwt_size = int(lwt.get("size", 1))
+            lwt_size = _int(lwt, "size", 1)
             leader_tmpl = lwt.get("leaderTemplate", {}) or {}
             worker_tmpl = lwt.get("workerTemplate", {}) or {}
 
@@ -295,11 +315,14 @@ class K8sState:
                 namespace, ds_name, "lws",
                 {"spec": worker_tmpl.get("spec", {})},
             )
-            # Zero-GPU role (a CPU router folded into the DS) is legitimate:
-            # contributes 0 to the GPU pool and should not make the DS
-            # unmanageable. Bail only on genuinely malformed templates
-            # (missing containers, ambiguous pool) — both come back None
-            # with a specific log already emitted downstream.
+            # Zero-GPU role (a CPU router folded into the DS) contributes 0
+            # to the GPU pool and the bundle remains manageable. Note that
+            # _placement_from_pod_template returns None silently on all its
+            # failure paths (no containers, no GPU limits, ambiguous pool),
+            # so "both None" can also mean "templates are malformed" — the
+            # apiserver usually rejects a DS whose templates have no
+            # containers before we'd see it, so we accept the ambiguity
+            # rather than complicate the helper's return type.
             if leader_place is None and worker_place is None:
                 members.append(("lws", f"{ds_name}-{role_name}"))
                 continue

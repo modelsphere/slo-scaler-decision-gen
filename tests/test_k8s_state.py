@@ -1,5 +1,6 @@
 """Tests for decision_gen.k8s_state — workload resolution + pool gap."""
 
+import logging
 from unittest.mock import MagicMock
 from types import SimpleNamespace
 
@@ -66,11 +67,23 @@ class _Api404(Exception):
         self.status = 404
 
 
-def _fake_apis(*, lws=None, sts=None, deploy=None, ds=None, nodes=None, pods=None):
+class _Api403(_Api404):
+    """403 variant of the shared ApiException stub — same class family so the
+    autouse monkeypatch on k8s_state.ApiException catches both."""
+
+    def __init__(self):
+        super().__init__()
+        self.status = 403
+
+
+def _fake_apis(*, lws=None, sts=None, deploy=None, ds=None, nodes=None, pods=None,
+               ds_error=None):
     """Build a (apps, core, custom) triple; missing workloads raise ApiException(404).
 
     Both LWS and DS resolve through CustomObjectsApi; dispatch by plural so
-    a test can provide one, both, or neither.
+    a test can provide one, both, or neither. `ds_error` (an exception instance)
+    makes the DS lookup raise instead of returning a payload — used to cover
+    the 403-fallthrough path where RBAC hasn't granted disaggregatedsets yet.
     """
     apps = MagicMock()
     if sts is None:
@@ -94,6 +107,8 @@ def _fake_apis(*, lws=None, sts=None, deploy=None, ds=None, nodes=None, pods=Non
         by_plural[k8s_state.DS_PLURAL] = ds
 
     def _get(group, version, namespace, plural, name):
+        if plural == k8s_state.DS_PLURAL and ds_error is not None:
+            raise ds_error
         if plural in by_plural:
             return by_plural[plural]
         raise _Api404()
@@ -494,6 +509,42 @@ def test_ds_missing_falls_through_to_deployment_unchanged():
     ]
     assert k8s_state.DS_PLURAL in plurals_checked
     assert k8s_state.LWS_PLURAL in plurals_checked
+
+
+def test_ds_403_falls_through_with_warning(caplog):
+    """DS lookup hits a 403 (missing ClusterRole rule) → resolver falls through
+    to LWS/STS/Deploy instead of raising. Only this service stays unmanaged;
+    a raise would abort the whole tick for every service. Warning names the
+    missing rule so the operator's fix is unambiguous — the follow-up
+    'no workload found' log doesn't hint at RBAC on its own."""
+    deploy = {"spec": {"template": _pod_template(gpu_limit=2)}}
+    apps, core, custom = _fake_apis(deploy=deploy, ds_error=_Api403())
+    state = K8sState(apps_v1=apps, core_v1=core, custom_v1=custom)
+    with caplog.at_level(logging.WARNING, logger="decision_gen.k8s_state"):
+        p = state.resolve_placement("ns", "plain-deployment")
+    assert p is not None
+    assert p.kind == "deployment"          # fell through, service still resolves
+    # Warning names the missing rule explicitly.
+    msgs = " ".join(r.getMessage() for r in caplog.records)
+    assert "forbidden reading DS" in msgs
+    assert "disaggregatedsets.disaggregatedset.x-k8s.io" in msgs
+
+
+def test_ds_500_raises():
+    """Non-4xx ApiExceptions (a real apiserver failure) still raise — the
+    controller's tick-level catch handles them. Swallowing 5xx would hide
+    genuine connectivity issues behind 'service unmanaged'."""
+    deploy = {"spec": {"template": _pod_template(gpu_limit=2)}}
+
+    class _Api500(_Api404):
+        def __init__(self):
+            super().__init__()
+            self.status = 500
+
+    apps, core, custom = _fake_apis(deploy=deploy, ds_error=_Api500())
+    state = K8sState(apps_v1=apps, core_v1=core, custom_v1=custom)
+    with pytest.raises(_Api500):
+        state.resolve_placement("ns", "plain-deployment")
 
 
 def test_ds_malformed_does_not_fall_through():
