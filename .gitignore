@@ -17,6 +17,5 @@ htmlcov/
 .DS_Store
 
 # Local-only docs and reference material — not shipped with the operator
-docs/
 fyis/
 CLAUDE.md
