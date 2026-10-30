@@ -45,6 +45,15 @@ info:
     consumer never reads the empty boot list as "run nothing". Readiness flips
     after the first attempt, even a failed one, which leaves the list empty.
 
+    ## Upcoming change: the response `apiVersion`
+
+    The `/decisions` `apiVersion` will change from
+    `llmscaling.inference.x-k8s.io/v1alpha1` to
+    `llmscaling.inference.modelsphere.dev/v1alpha1`, finishing the CRD group
+    move. Only the string changes; the shape stays. decision-gen switches only
+    after llm-operator and swissd accept both, so a consumer should accept both
+    values from now on.
+
     ## Authentication
 
     None. The Service is meant to be reached only from inside the cluster.
@@ -157,6 +166,8 @@ components:
           description: |
             The version of this payload's shape. A consumer refuses a value it
             does not know rather than guessing at the body; llm-operator does.
+            Will become `llmscaling.inference.modelsphere.dev/v1alpha1`; see
+            "Upcoming change" above.
         decisions:
           type: array
           items: { $ref: "#/components/schemas/Decision" }
