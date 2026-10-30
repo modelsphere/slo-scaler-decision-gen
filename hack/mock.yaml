@@ -1,0 +1,9 @@
+# hack/mock_decision_gen.py serves these as /decisions. Edit and save: the next request
+# reads the change. A save that does not parse keeps the last good list.
+#
+# Each entry is the CR namespace and spec.serviceId the consumer asks for (for
+# swiss, the release's namespace and name) and the replica count to report.
+decisions:
+  - namespace: models
+    serviceId: mock-llm-pd
+    replicas: 2
