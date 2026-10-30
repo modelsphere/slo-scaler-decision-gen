@@ -21,7 +21,7 @@ from urllib.parse import parse_qs, urlparse
 log = logging.getLogger(__name__)
 
 
-def make_handler(snapshot_fn, ready_fn=lambda: True):
+def make_handler(snapshot_fn, ready_fn=lambda: True, not_ready_reason="no tick yet"):
     """Factory. snapshot_fn() → decision payload dict. ready_fn() → bool."""
 
     class Handler(BaseHTTPRequestHandler):
@@ -35,11 +35,11 @@ def make_handler(snapshot_fn, ready_fn=lambda: True):
                 if ready_fn():
                     self._respond(200, {"status": "ok"})
                 else:
-                    self._respond(503, {"status": "not_ready", "reason": "no tick yet"})
+                    self._respond(503, {"status": "not_ready", "reason": not_ready_reason})
             elif path in ("/decisions", "/api/v1alpha1/decisions"):
                 if not ready_fn():
                     return self._respond(
-                        503, {"status": "not_ready", "reason": "no tick yet"})
+                        503, {"status": "not_ready", "reason": not_ready_reason})
                 params = parse_qs(urlparse(self.path).query)
                 payload = snapshot_fn()
                 ns_filter = params.get("namespace", [None])[0]
@@ -67,9 +67,10 @@ def make_handler(snapshot_fn, ready_fn=lambda: True):
     return Handler
 
 
-def serve(port, snapshot, ready=lambda: True):
+def serve(port, snapshot, ready=lambda: True, not_ready_reason="no tick yet"):
     """Block forever. Binds on all interfaces."""
-    server = ThreadingHTTPServer(("0.0.0.0", port), make_handler(snapshot, ready))
+    server = ThreadingHTTPServer(
+        ("0.0.0.0", port), make_handler(snapshot, ready, not_ready_reason))
     log.info("decision-gen listening on :%d", port)
     try:
         server.serve_forever()
