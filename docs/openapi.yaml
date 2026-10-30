@@ -1,0 +1,197 @@
+openapi: 3.1.0
+info:
+  title: decision-gen
+  version: 0.8.0
+  summary: Replica decisions for LLM inference services, from their SLOs and live signals.
+  description: |
+    decision-gen decides how many replicas each service should run and serves
+    that list. It scales nothing itself: an actuator reads `GET /decisions` and
+    acts on it. Today that is llm-operator's `LLMScaler` (the Custom provider)
+    and swissd's PD autoscale loop.
+
+    ```
+    LLMSLORequirement CRs --+
+    JobSLORequirement CRs --+
+    Kubernetes workloads ---+--> decision-gen --> GET /decisions --> actuator
+    Prometheus signals -----+     (every TICK_SECONDS, default 60)
+    ```
+
+    Every tick it rebuilds the list from scratch; the response is the list the
+    last tick committed. The targets come from the SLO CRs, which slo-api edits;
+    decision-gen only reads them.
+
+    ## Which services are listed
+
+    A service is listed once its CR has a `maximumDeployment`, its workload
+    resolves, and a tick has committed a count for it. It is keyed by the CR's
+    namespace and `spec.serviceId`.
+
+    - A CR with no `maximumDeployment` has opted out of autoscaling, and its
+      service is not added to the list.
+    - A service already listed stays listed at its last count if its CR loses
+      `maximumDeployment` or its workload stops resolving, until the CR is
+      deleted.
+    - A service whose workload has no ready replicas this tick stays listed at
+      its last count.
+    - A tick that fails leaves the previous list in place.
+    - Deleting the CR removes the service from the next list.
+
+    A service that is not listed has no decision. That is not a decision of 0;
+    a decision of 0 is listed as `active: 0`.
+
+    ## Readiness
+
+    `/decisions` and `/readyz` answer `503` until the first tick has run, so a
+    consumer never reads the empty boot list as "run nothing". Readiness flips
+    after the first attempt, even a failed one, which leaves the list empty.
+
+    ## Upcoming change: the response `apiVersion`
+
+    The `/decisions` `apiVersion` will change from
+    `llmscaling.inference.x-k8s.io/v1alpha1` to
+    `llmscaling.inference.modelsphere.dev/v1alpha1`, finishing the CRD group
+    move. Only the string changes; the shape stays. decision-gen switches only
+    after llm-operator and swissd accept both, so a consumer should accept both
+    values from now on.
+
+    ## Authentication
+
+    None. The Service is meant to be reached only from inside the cluster.
+
+    ## Errors
+
+    An unknown path is `404` with `{"error": "not found"}`. A method other than
+    `GET` gets `501` from the HTTP server itself, with an HTML body.
+  license:
+    name: Apache-2.0
+    identifier: Apache-2.0
+
+servers:
+  - url: http://decision-gen.llm-scaler.svc
+    description: In cluster, the Service the llm-slo-decision-gen chart creates (port 80).
+  - url: http://localhost:8080
+    description: Run locally (`PORT`, default 8080).
+
+# No authentication.
+security: []
+
+tags:
+  - name: decisions
+    description: The replica decisions.
+  - name: health
+    description: Probes.
+
+paths:
+  /decisions:
+    get:
+      tags: [decisions]
+      summary: List replica decisions
+      description: |
+        The last committed list, sorted by namespace then serviceId.
+        `/api/v1alpha1/decisions` is an alias.
+
+        Both filters match exactly; an empty value is no filter. A consumer
+        should take exactly one entry for its service and treat none, or more
+        than one, as no decision.
+      operationId: listDecisions
+      parameters:
+        - name: namespace
+          in: query
+          description: Only the decisions in this namespace.
+          schema: { type: string }
+        - name: serviceId
+          in: query
+          description: Only the decisions for this `spec.serviceId`.
+          schema: { type: string }
+      responses:
+        "200":
+          description: The decisions.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Decisions" }
+              example:
+                apiVersion: llmscaling.inference.x-k8s.io/v1alpha1
+                decisions:
+                  - namespace: models
+                    serviceId: glm-53
+                    replicas: { active: 3 }
+        "503": { $ref: "#/components/responses/NotReady" }
+
+  /healthz:
+    get:
+      tags: [health]
+      summary: Liveness
+      description: "`/health` is an alias."
+      operationId: healthz
+      responses:
+        "200":
+          description: The HTTP server is up.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Status" }
+              example: { status: ok }
+
+  /readyz:
+    get:
+      tags: [health]
+      summary: Readiness
+      description: Ready once the first tick has run.
+      operationId: readyz
+      responses:
+        "200":
+          description: A tick has run.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Status" }
+              example: { status: ok }
+        "503": { $ref: "#/components/responses/NotReady" }
+
+components:
+  responses:
+    NotReady:
+      description: No tick has run yet.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Status" }
+          example: { status: not_ready, reason: no tick yet }
+
+  schemas:
+    Decisions:
+      type: object
+      required: [apiVersion, decisions]
+      properties:
+        apiVersion:
+          type: string
+          const: llmscaling.inference.x-k8s.io/v1alpha1
+          description: |
+            The version of this payload's shape. A consumer refuses a value it
+            does not know rather than guessing at the body; llm-operator does.
+            Will become `llmscaling.inference.modelsphere.dev/v1alpha1`; see
+            "Upcoming change" above.
+        decisions:
+          type: array
+          items: { $ref: "#/components/schemas/Decision" }
+
+    Decision:
+      type: object
+      required: [namespace, serviceId, replicas]
+      properties:
+        namespace: { type: string, description: The SLO CR's namespace. }
+        serviceId: { type: string, description: The SLO CR's `spec.serviceId`. }
+        replicas:
+          type: object
+          required: [active]
+          properties:
+            active:
+              type: integer
+              minimum: 0
+              description: |
+                How many replicas to run, within the CR's minimum and maximum. For
+                a DisaggregatedSet, a replica is one slice.
+
+    Status:
+      type: object
+      required: [status]
+      properties:
+        status: { type: string, enum: [ok, not_ready] }
+        reason: { type: string }
