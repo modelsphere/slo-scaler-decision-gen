@@ -54,6 +54,43 @@ info:
     after llm-operator and swissd accept both, so a consumer should accept both
     values from now on.
 
+    ## PD (pdengine) decisions
+
+    A `LLMSLORequirement` whose `maximumDeployment.type` is `pdengine` bounds
+    a PD-disaggregated service in *engines* — prefill plus decode replicas —
+    rather than bundles. decision-gen never moves `spec.slices`; it only
+    adjusts the per-slice prefill/decode pair. For such services the
+    decision row is additive:
+
+    ```json
+    {
+      "namespace": "test-dsset",
+      "serviceId": "vllm-qwen36-2p1d",
+      "replicas": { "active": 1 },
+      "shape": {
+        "pd": {
+          "prefill": { "replicas": 2, "liveReplicas": 2 },
+          "decode":  { "replicas": 1, "liveReplicas": 1 },
+          "slices": 1
+        }
+      }
+    }
+    ```
+
+    · `replicas.active` is the live slice count (n) — it never changes.
+    · `shape.pd` is the committed per-slice shape the consumer applies.
+    · `liveReplicas` are what the DS spec is running right now; consumers
+      that only need the target can ignore them.
+
+    `shape` never appears on replica-typed rows; consumers that don't
+    care about PD can keep reading `replicas.active` and ignore it.
+
+    A service whose bounds go below the ≥1-per-role floor (min = max ≤ 2
+    engines per slice) is compressed to `(1 prefill, 1 decode)` — the
+    smallest liveable PD shape — and logged at error level, never
+    omitted. Omission happens only when the DS itself is unreachable
+    or the bounds window is mathematically empty.
+
     ## Authentication
 
     None. The Service is meant to be reached only from inside the cluster.
@@ -187,7 +224,49 @@ components:
               minimum: 0
               description: |
                 How many replicas to run, within the CR's minimum and maximum. For
-                a DisaggregatedSet, a replica is one slice.
+                a DisaggregatedSet, a replica is one slice. On a pdengine row
+                this mirrors the live slice count (n), which the autoscaler
+                never moves.
+        shape:
+          type: object
+          description: |
+            Optional. Present only on rows for CRs whose
+            `maximumDeployment.type` is `pdengine`. Consumers that don't
+            understand PD can ignore the whole block; the load-bearing
+            number is still `replicas.active`.
+          properties:
+            pd:
+              type: object
+              required: [slices, prefill, decode]
+              properties:
+                slices:
+                  type: integer
+                  minimum: 1
+                  description: Live `spec.slices`; informational.
+                prefill:
+                  type: object
+                  required: [replicas, liveReplicas]
+                  properties:
+                    replicas:
+                      type: integer
+                      minimum: 0
+                      description: Committed prefill engines per slice.
+                    liveReplicas:
+                      type: integer
+                      minimum: 0
+                      description: What the DS spec is running today.
+                decode:
+                  type: object
+                  required: [replicas, liveReplicas]
+                  properties:
+                    replicas:
+                      type: integer
+                      minimum: 0
+                      description: Committed decode engines per slice.
+                    liveReplicas:
+                      type: integer
+                      minimum: 0
+                      description: What the DS spec is running today.
 
     Status:
       type: object

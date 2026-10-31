@@ -53,6 +53,7 @@ class FakeSignals:
         self.rejection_count_val = None
         self.request_count_val = None
         self.replicas_ready_val = None
+        self.replicas_ready_role_val = {}  # {role: value | Reading}
         self.queue_depth_overrides = {}    # {(ns, svc): value | Reading}
         self.queue_depth_default = None    # fallback when no override
         self.calls = []
@@ -91,6 +92,13 @@ class FakeSignals:
     def replicas_ready(self, ns, svc):
         self.calls.append(("replicas_ready", ns, svc))
         return self._wrap(self.replicas_ready_val)
+
+    def replicas_ready_role(self, ns, svc, role):
+        self.calls.append(("replicas_ready_role", ns, svc, role))
+        return self._wrap(self.replicas_ready_role_val.get(role))
+
+    def set_replicas_ready_role(self, role, value):
+        self.replicas_ready_role_val[role] = value
 
     def queue_depth(self, ns, svc, promql):
         self.calls.append(("queue_depth", ns, svc, promql))
@@ -173,6 +181,19 @@ def cr_spec():
         "priority": 5,
         "minimumDeployment": {"type": "replica", "value": 1},
         "maximumDeployment": {"type": "replica", "value": 8},
+        "ttft": {"default": {"metrics": [{"type": "p80", "threshold": 20.0}]}},
+        "otps": {"default": {"metrics": [{"type": "p80", "threshold": 30.0}]}},
+    }
+
+
+@pytest.fixture
+def pd_cr_spec():
+    """pdengine-typed CR: bounds are in engines, not bundles."""
+    return {
+        "serviceId": "svc",
+        "priority": 5,
+        "minimumDeployment": {"type": "pdengine", "value": 6},
+        "maximumDeployment": {"type": "pdengine", "value": 24},
         "ttft": {"default": {"metrics": [{"type": "p80", "threshold": 20.0}]}},
         "otps": {"default": {"metrics": [{"type": "p80", "threshold": 30.0}]}},
     }

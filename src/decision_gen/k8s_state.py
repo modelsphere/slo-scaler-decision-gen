@@ -56,6 +56,40 @@ def _canonical_pool(product):
 
 
 @dataclass(frozen=True)
+class PDSpec:
+    """PD shape of a DisaggregatedSet, per the prefill/decode convention.
+
+    An *engine* is one LWS group of a role (`spec.replicas` groups of
+    `leaderWorkerTemplate.size` pods each). Engines per slice:
+    prefill × decode below; the whole service runs `slices` of them.
+    Engine counts are the currency of pdengine-typed CR bounds; bundle
+    counts (`slices`) stay a deploy-time property the scaler reads but
+    never moves.
+    """
+    slices: int
+    prefill: int               # prefill engine groups per slice
+    decode: int                # decode engine groups per slice
+    # GPUs per engine group, per role — routers and other CPU-only
+    # roles are absent. {"prefill": 8, "decode": 8} on a 2P1D H100 DS.
+    role_group_gpus: dict = None
+
+    def bundle_gpus(self):
+        """GPUs in one slice: Σ over GPU-requesting roles of
+        groups × per-group GPUs. A role contributes only when its
+        engines per slice is nonzero; roles like the router never
+        enter `role_group_gpus` at all."""
+        total = 0
+        for role, gpus in self.role_group_gpus.items():
+            v = getattr(self, role, 0)
+            total += v * gpus
+        return total
+
+    def engines_live(self):
+        """Total engine groups across all slices (prefill + decode)."""
+        return self.slices * (self.prefill + self.decode)
+
+
+@dataclass(frozen=True)
 class Placement:
     """Per-service contract read from its workload template."""
     namespace: str
@@ -69,6 +103,10 @@ class Placement:
     # Empty means "single workload" — consumers see it as ((kind, workload_name),).
     # DisaggregatedSet bundles pass the per-role LWS list explicitly.
     members: tuple = ()
+    # PD shape, populated only on disaggregatedset placements whose
+    # GPU-requesting roles are exactly {prefill, decode}. None on every
+    # other workload — pdengine-typed CRs refuse such placements.
+    pd: "PDSpec | None" = None
 
     def member_workloads(self):
         """Return the (kind, name) tuple list. Defaults to the single-workload
@@ -298,6 +336,8 @@ class K8sState:
         pools = set()
         gpus_per_slice = 0
         members = []
+        role_engines = {}        # name -> spec.replicas (engine groups / slice)
+        role_group_gpus = {}     # name -> GPUs per engine group (leader+workers)
         for role in roles:
             role_name = role.get("name", "") or ""
             role_spec = role.get("spec", {}) or {}
@@ -350,6 +390,8 @@ class K8sState:
             pools.add(leader_place.pool)
             per_group = lwt_size * leader_place.gpus_per_replica
             gpus_per_slice += role_replicas * per_group
+            role_engines[role_name] = role_replicas
+            role_group_gpus[role_name] = per_group
             members.append(("lws", f"{ds_name}-{role_name}"))
 
         if len(pools) != 1:
@@ -365,8 +407,27 @@ class K8sState:
             log.warning("DS %s/%s has no GPU-requesting roles; unmanageable",
                         namespace, ds_name)
             return None
-        pool = next(iter(pools))
 
+        # pdengine-typed CRs need the prefill/decode convention; any other
+        # GPU-role mix is still a valid *replica*-typed bundle, so we log
+        # loudly and leave `pd=None` — the pdengine branch will refuse to
+        # manage the service and the replica branch keeps working.
+        pd = None
+        if set(role_engines) == {"prefill", "decode"}:
+            pd = PDSpec(
+                slices=slices,
+                prefill=role_engines["prefill"],
+                decode=role_engines["decode"],
+                role_group_gpus=role_group_gpus,
+            )
+        else:
+            log.warning(
+                "DS %s/%s GPU roles %s are not the prefill/decode pair; "
+                "pdengine-typed CRs will skip it (replica-typed CRs unaffected)",
+                namespace, ds_name, sorted(role_engines),
+            )
+
+        pool = next(iter(pools))
         return Placement(
             namespace=namespace, name=ds_name, kind="disaggregatedset",
             pool=pool,
@@ -374,6 +435,7 @@ class K8sState:
             workload_name=ds_name,
             spec_replicas=slices,
             members=tuple(members),
+            pd=pd,
         )
 
     def _placement_from_lws(self, namespace, workload_name, lws_obj):

@@ -24,6 +24,26 @@ no `v` prefix; each tag publishes the image
   workloads for log tracing. Reading the DS requires `get/list/watch` on
   `disaggregatedsets.disaggregatedset.x-k8s.io` — RBAC is owned by the
   deployment chart.
+- PD engine scaling for CRs whose `maximumDeployment.type` is `pdengine`
+  (bounds in engines, not bundle replicas).
+  - A pdengine row in `/decisions` carries `shape.pd` alongside
+    `replicas.active` (the live `spec.slices`, which the autoscaler
+    never moves). The block pairs the committed per-slice prefill
+    and decode engine counts with the `liveReplicas` the DS spec is
+    currently running.
+  - The signal→role policy maps ttft violations to prefill growth,
+    otps violations to decode growth, rejection spikes to both roles at
+    the same multiplier, and a comfort shed to whichever role has the
+    larger SLO-margin; bounds violations are corrected at the live
+    P:D ratio (grow → ceil, shrink → floor, residual walked one
+    engine at a time ties to decode).
+  - Physical engine counts come from the existing bodylog series
+    `bodylog_service_replicas_ready{..., role="prefill"|"decode"}` —
+    every other metric (ttft, otps, rejection, request / rejection
+    counts) stays service-level.
+  - Live shapes tighter than the ≥1-per-role floor are compressed
+    to (1p,1d) and logged at error level rather than dropped from
+    `/decisions`.
 
 ### Changed
 - GitHub Actions pinned to commit SHAs.

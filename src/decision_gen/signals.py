@@ -234,3 +234,31 @@ class Signals:
         if r.state != "ok":
             return r
         return Reading(int(r.value + 0.5), "ok")
+
+    def replicas_ready_role(self, namespace, service_id, role):
+        """Physical ready engine count for one PD role.
+
+        Same series as `replicas_ready`, filtered by the `role` label
+        the log-service added for pdengine workloads ("prefill" |
+        "decode"):
+
+            max by(service, role)(avg_over_time(
+                bodylog_service_replicas_ready{
+                    service="...", role="..."}[2m]))
+
+        Every non-ok state is returned untouched — the caller
+        (serviceview PD branch) treats a missing role series as "fall
+        back to the committed value", matching the spec-fallback
+        posture the rest of the serviceview uses when replicas_ready
+        goes quiet.
+        """
+        svc = self._svc(namespace, service_id)
+        r = self._query(
+            f'max by(service, role)(avg_over_time('
+            f'bodylog_service_replicas_ready{{service="{svc}", role="{role}"}}'
+            f'[2m]))',
+            label=f"replicas.role[{role}]",
+        )
+        if r.state != "ok":
+            return r
+        return Reading(int(r.value + 0.5), "ok")
