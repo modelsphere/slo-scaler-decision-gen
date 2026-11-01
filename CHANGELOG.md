@@ -8,6 +8,8 @@ no `v` prefix; each tag publishes the image
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-11-01
+
 ### Added
 - CI on every pull request and push to `main`: the pytest suite, plus a gate
   for the license text and committed credentials.
@@ -64,7 +66,7 @@ no `v` prefix; each tag publishes the image
 ### Changed
 - GitHub Actions pinned to commit SHAs.
 - The README says where the released image is published.
-- Removing `maximumDeployment` from a listed service's CR drops the
+- **Breaking:** removing `maximumDeployment` from a listed service's CR drops the
   service from `/decisions` on the next tick, instead of freezing it
   at its last committed count. Adding `maximumDeployment` back
   re-lists the service from a fresh boot seed (cooldowns restarted).
@@ -73,7 +75,9 @@ no `v` prefix; each tag publishes the image
   llm-operator treats a missing row as "hold replicas, mark
   ScalingActive=False" and hands control back to the CR author.
   Replica and pdengine services behave the same way here.
-- **Fix:** per-pod GPU accounting is now the *sum* of container
+
+### Fixed
+- Per-pod GPU accounting is now the *sum* of container
   `nvidia.com/gpu` limits, not the max. PD-colocate pods (prefill +
   decode engine containers sharing one pod, each requesting its own
   slice of the node's GPUs) now bill their full footprint. Single-
@@ -118,6 +122,7 @@ First tagged release.
 - The Dockerfile's base image and PyPI index are build args that default to
   the public ones.
 
-[Unreleased]: https://github.com/modelsphere/slo-scaler-decision-gen/compare/0.7.0...HEAD
+[Unreleased]: https://github.com/modelsphere/slo-scaler-decision-gen/compare/0.8.0...HEAD
+[0.8.0]: https://github.com/modelsphere/slo-scaler-decision-gen/compare/0.7.0...0.8.0
 [0.7.0]: https://github.com/modelsphere/slo-scaler-decision-gen/compare/0.6.0...0.7.0
 [0.6.0]: https://github.com/modelsphere/slo-scaler-decision-gen/releases/tag/0.6.0
