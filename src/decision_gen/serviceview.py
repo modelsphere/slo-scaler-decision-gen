@@ -5,7 +5,9 @@ across controller dicts (`_last_change_at`, `_last_served`,
 `_comfortable_since`), which is why the tick function was a tangle.
 
 Owns, per (ns, service):
-  - committed           int   — direction authority; capacity booking
+  - committed           int | PdShape — direction authority; capacity
+                        booking. pdengine services carry engines, not
+                        bundles: `committed = pd.PdShape(p, d, ...)`.
   - last_change_at      epoch — single clock, two thresholds (D1)
   - comfortable_since   epoch | None — unbroken comfort streak (R4)
 
@@ -22,7 +24,7 @@ import logging
 import os
 from collections import namedtuple
 
-from decision_gen import direction, triggers
+from decision_gen import direction, pd, triggers
 from decision_gen.thresholds import METRIC_DIRECTION, Verdict, classify
 
 log = logging.getLogger(__name__)
@@ -58,11 +60,16 @@ Transition = namedtuple("Transition", [
     "comfort_s",           # int | None — seconds of unbroken comfort
     # stages in order: est (post-clamp) → want (post-direction)
     "phase",               # direction.Phase
-    "proposal",            # triggers.Proposal | None
+    "proposal",            # triggers.Proposal | triggers.Proposal | None
     "est",
     "want",
     "hold_reason",         # '' on propose, else e.g. 'hold-cooldown-up 1200s<1800s'
     "skip",                # bool — controller must not touch this service this tick
+    "pd_pool",             # pool name the pd_shape steps against (pdengine only)
+    # pdengine services carry the whole PdShape here so the
+    # controller can hand the wire the (prefill, decode) pair it
+    # committed. `None` on replica / job services.
+    "pd_shape",
 ])
 
 
@@ -87,6 +94,36 @@ def _bounds(cr_spec):
         mx = mn
     pri = int(cr_spec.get("priority") or 0)
     return mn, mx, pri
+
+
+def _bounds_kind(cr_spec):
+    """The `type` of the CR's bounds. "replica" (default) or "pdengine".
+
+    Engine bounds mean `min` and `max` are fleet *engine* totals, not
+    bundle counts. The function does not check whether the workload is
+    actually a DisaggregatedSet — `ServiceView.step` owns that gate.
+    Only called once `_bounds(cr_spec)` has returned non-None.
+    """
+    return ((cr_spec.get("maximumDeployment") or {}).get("type") or "replica")
+
+
+def _thresholds_of(cr_spec, signal):
+    """CR thresholds for one signal as `{kind: float}`. Same shape the
+    `_threshold(cr_spec, signal, kind)` lookup produces, hoisted for
+    the PD margin fold."""
+    block = (cr_spec.get(signal) or {}).get("default") or {}
+    return {
+        m["type"]: m["threshold"]
+        for m in block.get("metrics") or []
+        if isinstance(m, dict) and m.get("type") is not None
+        and m.get("threshold") is not None
+    }
+
+
+def _ok_value(reading):
+    """Reading.value iff state==\"ok\" else None. Tiny guard so the PD
+    trigger call isn't a ternary pile."""
+    return reading.value if reading is not None and reading.state == "ok" else None
 
 
 def _threshold(cr_spec, signal, kind):
@@ -115,12 +152,25 @@ class ServiceView:
         the committed value changed."""
         if self.committed == replicas:
             return False
-        log.info("%s/%s: commit %s→%d (%s)",
-                 self.ns, self.service, self.committed, replicas, cause)
+        log.info("%s/%s: commit %s→%s (%s)",
+                 self.ns, self.service, _fmt_committed(self.committed),
+                 _fmt_committed(replicas), cause)
         self.committed = replicas
         self.last_change_at = now
         self.comfortable_since = None
         return True
+
+    def reset_committed(self, cause):
+        """Drop `committed` (and the R4 streak) when the ledger's currency
+        changed — a CR whose `type` flips between replica and pdengine
+        re-seeds from scratch next tick instead of comparing an int
+        against a PdShape."""
+        if self.committed is None:
+            return
+        log.info("%s/%s: reset committed %s (%s)",
+                 self.ns, self.service, _fmt_committed(self.committed), cause)
+        self.committed = None
+        self.comfortable_since = None
 
     # ---------- boot (R7) ----------
 
@@ -132,6 +182,311 @@ class ServiceView:
             return
         mn, mx, _ = _bounds(cr_spec)
         self.commit(max(mn, min(mx, placement.spec_replicas)), now, cause="boot-seed")
+
+    # ---------- pdengine ----------
+
+    def _pd_skip(self, placement, physical, now, hold_reason,
+                 verdicts=None):
+        """Skip-row Transition for the pdengine branch: the service is
+        not committed this tick, and (on bound-fix refusal) must also
+        be *omitted* from /decisions. Controller reads `skip` to mean
+        the former; the pdengine omit path adds `pd_shape=None` so the
+        wire never serves a bound-breaking shape."""
+        return Transition(
+            ns=self.ns, service=self.service,
+            pool=placement.pool, gpr=placement.gpus_per_replica,
+            kind=placement.kind, spec_replicas=placement.spec_replicas,
+            readings={}, verdicts=verdicts or {"ttft": {}, "otps": {}},
+            physical=physical,
+            gates=triggers.Gates(up_cooldown_open=False, shed_ready=False),
+            since_change_s=int(now - self.last_change_at),
+            comfort_s=(None if self.comfortable_since is None
+                       else int(now - self.comfortable_since)),
+            phase=direction.Phase.SETTLED,
+            proposal=None,
+            est=0, want=0,
+            hold_reason=hold_reason,
+            skip=True,
+            pd_pool=None,
+            pd_shape=None,
+        )
+
+    def _step_pd(self, readings, placement, cr_spec, physical, bounds, now):
+        """pdengine branch of `step`. One PdShape in, one out; n is a
+        constant here by policy — the scaler never touches
+        `spec.slices`.
+
+        Stages mirror the replica path but work on a per-slice
+        PdShape:
+            live         — current shape from the DS spec
+            bounds-fix   — same-ratio walk into the CR window
+                             (infeasible → skip; row dropped)
+            physical     — per-role engine counts; missing → hold
+            verdicts     — service-level ttft/otps/rejection, same
+                           algebra as LLM replicas
+            triggers     — per-role engine proposal (ttft→prefill,
+                           otps→decode, fire→both, shed→margin)
+            direction    — per-role ramp/drain freeze
+        `physical` for PD is a pair `(prefill, decode)` from
+        replicas_ready_role; the service-level `physical` arg is only
+        consulted for the no-stats / zero guard. When per-role series
+        are missing the branch holds — without them the direction
+        freeze can't see ramps/drains (I4).
+        """
+        mn, mx, _pri = bounds
+        spec = placement.pd
+        if spec is None:
+            log.warning(
+                "%s/%s: pdengine CR but %s placement has no prefill/decode "
+                "pair; skipping every tick",
+                self.ns, self.service, placement.kind,
+            )
+            return self._pd_skip(placement, physical, now,
+                                  "hold-pdengine-non-ds")
+        if spec.slices != 1:
+            log.warning(
+                "%s/%s: pdengine CR on DS with slices=%d (policy: n=1 only); "
+                "skipping every tick",
+                self.ns, self.service, spec.slices,
+            )
+            return self._pd_skip(placement, physical, now,
+                                  f"hold-pdengine-slices-{spec.slices}")
+
+        # CR currency flip mid-life (pdengine ↔ replica): the ledger's
+        # units have changed; the old committed value is meaningless.
+        if self.committed is not None and not hasattr(self.committed, "prefill"):
+            self.reset_committed(cause="cr-type-flip")
+
+        # ---- live shape; seeding happens BEFORE the no-physical guard
+        # so a brand-new pdengine CR is advertised on the wire at its
+        # seeded shape even when replicas_ready never comes up — same
+        # posture as the replica path.
+        live = pd.PdShape(spec.prefill, spec.decode,
+                          spec.prefill + spec.decode)
+        if self.committed is None:
+            self.commit(live, now, cause="boot-seed")
+
+        if physical is None or physical == 0:
+            # Transient bodylog lull. Serve the last committed shape
+            # rather than dropping the row from the wire — same
+            # failure posture as the replica path. Only structural
+            # breaks (non-ds, slices != 1) fall through to the
+            # view-omitting _pd_skip.
+            empty = {"ttft": {}, "otps": {}}
+            return Transition(
+                ns=self.ns, service=self.service,
+                pool=placement.pool, gpr=placement.gpus_per_replica,
+                kind=placement.kind, spec_replicas=placement.spec_replicas,
+                readings={}, verdicts=empty,
+                physical=physical,
+                gates=triggers.Gates(up_cooldown_open=False,
+                                      shed_ready=False),
+                since_change_s=int(now - self.last_change_at),
+                comfort_s=(None if self.comfortable_since is None
+                           else int(now - self.comfortable_since)),
+                phase=direction.Phase.SETTLED,
+                proposal=None,
+                est=self.committed, want=self.committed,
+                hold_reason=f"hold-no-physical-data physical={physical}",
+                skip=True,
+                pd_pool=None,
+                pd_shape=self.committed,
+            )
+
+        lo, hi = pd.per_slice_window(mn, mx, spec.slices)
+        # Bounds-fix only fires when *committed* has drifted outside
+        # the window — never to absorb routine live drift. In-window
+        # differences between live and committed are the SLO/margin
+        # layer's business, not the bounds layer's.
+        if not (lo <= self.committed.engines <= hi):
+            fixed = pd.correct_to_bounds(
+                live.prefill, live.decode, lo, hi,
+            )
+            # correct_to_bounds refuses below the ≥1-per-role floor.
+            # Bounds that tight are a configuration emergency, not a
+            # reason to vanish from the wire: compress to the smallest
+            # liveable shape, log loudly, and let the CR author notice
+            # that bounds and live shape disagree.
+            if fixed is None and hi >= 2:
+                log.error(
+                    "%s/%s: pdengine bounds min=%d max=%d (per-slice "
+                    "%s..%s) cannot express live shape %dp%dd; "
+                    "compressing to 1p1d rather than dropping the "
+                    "service from /decisions",
+                    self.ns, self.service, mn, mx, lo, hi,
+                    live.prefill, live.decode,
+                )
+                fixed = pd.PdShape(1, 1, 2)
+        else:
+            fixed = None
+        if fixed is None and not (lo <= self.committed.engines <= hi):
+            log.error(
+                "%s/%s: pdengine bounds min=%d max=%d (per-slice %s..%s) "
+                "violate live shape %dp%dd; omitting service from "
+                "/decisions rather than emitting a bound-breaking shape",
+                self.ns, self.service, mn, mx, lo, hi,
+                live.prefill, live.decode,
+            )
+            return self._pd_skip(placement, physical, now,
+                                  f"hold-pdengine-bounds min={mn} max={mx}")
+        if fixed is not None and fixed != self.committed:
+            self.commit(fixed, now, cause="pd-bounds-fix")
+
+        # ---- verdicts + comfort streak (same algebra as LLM path)
+        verdicts, missing_slo = self._llm_verdicts(readings, cr_spec)
+        rej = readings.get("rejection")
+        rej_value = rej.value if rej is not None and rej.state == "ok" else None
+
+        flat = [v for sig in verdicts.values() for v in sig.values()]
+        any_missing = missing_slo or (rej is not None and rej.state != "ok")
+        all_comfy = (not any_missing
+                     and bool(flat)
+                     and all(v is Verdict.COMFORTABLE for v in flat))
+        if all_comfy:
+            if self.comfortable_since is None:
+                self.comfortable_since = now
+        else:
+            self.comfortable_since = None
+
+        since_change = now - self.last_change_at
+        comfort_s = (None if self.comfortable_since is None
+                     else now - self.comfortable_since)
+        gates = triggers.Gates(
+            up_cooldown_open=since_change >= UP_COOLDOWN_S,
+            shed_ready=(since_change >= DOWN_COOLDOWN_S
+                        and comfort_s is not None
+                        and comfort_s >= COMFORT_SUSTAIN_S),
+        )
+
+        # ---- per-role physical + margins + flat verdict map
+        physical_pd = self._physical_pd(readings)
+        if physical_pd is None:
+            # Without per-role physical evidence the direction freeze
+            # cannot run (I4); fall back to a hold rather than decide
+            # blind. Resolves itself once llm-openresty#26 exposes the
+            # role label.
+            return self._pd_transition(
+                readings, verdicts, placement, physical, None,
+                now, gates, proposal=None,
+                est=self.committed, want=self.committed,
+                hold_reason="hold-pd-no-role-physical",
+            )
+        margins = pd.role_margins(
+            readings.get("ttft") or {},
+            readings.get("otps") or {},
+            _thresholds_of(cr_spec, "ttft"),
+            _thresholds_of(cr_spec, "otps"),
+            SLO_HEADROOM,
+        )
+        flat_verdicts = {
+            f"{sig}.{kind}": v
+            for sig, by_kind in verdicts.items()
+            for kind, v in by_kind.items()
+        }
+
+        if missing_slo:
+            return self._pd_transition(
+                readings, verdicts, placement, physical, physical_pd,
+                now, gates, proposal=None,
+                est=self.committed, want=self.committed,
+                hold_reason=f"hold-missing-signal {','.join(missing_slo)}",
+            )
+
+        # ---- triggers on engines, margins drive the shed pick
+        rej_count = _ok_value(readings.get("rejection_count"))
+        req_count = _ok_value(readings.get("request_count"))
+        proposal = triggers.evaluate_pd(
+            flat_verdicts, margins, rej_value, self.committed, gates,
+            rejection_count=rej_count, request_count=req_count,
+        )
+
+        if proposal is None:
+            est = self.committed
+            hold_reason = _hold_reason(flat_verdicts, gates,
+                                       since_change, comfort_s)
+        else:
+            # CR clamp is authority on the wire (R9). Trim the
+            # proposal's *delta* to fit the window — take back some
+            # of the engines it added, or restore some it removed —
+            # never reshuffle the sibling role's existing engines.
+            # Committed-out-of-window is owned by the bounds-fix
+            # path, not this one. A partial trim (what remains still
+            # moves engines) is *clamped-*, not hold-*: hold-* means
+            # "no change this tick" to log parsers.
+            est = proposal.replicas
+            if est.engines > hi:
+                proposed_engines = est.engines
+                est = pd.trim_growth_to_cap(est, self.committed, hi)
+                hold_reason = (f"clamped-pd-max proposed={proposed_engines} "
+                               f"cap={hi}")
+                if est == self.committed:
+                    hold_reason = (f"hold-pd-max-clamp proposed={proposed_engines} "
+                                   f"cap={hi}")
+            elif est.engines < lo:
+                proposed_engines = est.engines
+                est = pd.pad_shed_to_floor(est, self.committed, lo)
+                hold_reason = (f"clamped-pd-min proposed={proposed_engines} "
+                               f"floor={lo}")
+                if est == self.committed:
+                    hold_reason = (f"hold-pd-min-clamp proposed={proposed_engines} "
+                                   f"floor={lo}")
+            else:
+                hold_reason = ""
+
+        # ---- per-role direction freeze
+        want, d_reason = direction.reconcile_pd(
+            est, self.committed,
+            direction.phase_of_pd(
+                (self.committed.prefill, self.committed.decode),
+                physical_pd,
+            ),
+        )
+        if d_reason:
+            hold_reason = d_reason
+
+        return self._pd_transition(
+            readings, verdicts, placement, physical, physical_pd, now,
+            gates, proposal, est=est, want=want, hold_reason=hold_reason,
+        )
+
+    def _physical_pd(self, readings):
+        """(prefill, decode) physical engine counts, or None.
+
+        Returns None when *either* role series is missing — not a
+        per-role fallback. Until llm-openresty#26 exposes the role
+        label that never happens in production; synthesising a count
+        from committed would silently defeat the direction freeze
+        (I4)."""
+        def _role(role):
+            r = readings.get(f"replicas_ready_{role}")
+            if r is not None and r.state == "ok" and r.value is not None:
+                return int(r.value)
+            return None
+        p, d = _role("prefill"), _role("decode")
+        if p is None or d is None:
+            return None
+        return (p, d)
+
+    def _pd_transition(self, readings, verdicts, placement, physical,
+                     physical_pd, now, gates, proposal, est, want,
+                     hold_reason):
+        return Transition(
+            ns=self.ns, service=self.service,
+            pool=placement.pool, gpr=placement.gpus_per_replica,
+            kind=placement.kind, spec_replicas=placement.spec_replicas,
+            readings=readings, verdicts=verdicts,
+            physical=physical_pd,
+            gates=gates,
+            since_change_s=int(now - self.last_change_at),
+            comfort_s=(None if self.comfortable_since is None
+                       else int(now - self.comfortable_since)),
+            phase=direction.Phase.SETTLED,   # PD uses reconcile_pd for phases
+            proposal=proposal,
+            est=est, want=want, hold_reason=hold_reason,
+            skip=False,
+            pd_pool=placement.pool,
+            pd_shape=want,
+        )
 
     # ---------- main ----------
 
@@ -167,7 +522,17 @@ class ServiceView:
                 want=self.committed if self.committed is not None else 0,
                 hold_reason="hold-no-max-in-cr (user opted out of autoscale)",
                 skip=True,
+                pd_pool=None,
+                pd_shape=None,
             )
+        if _bounds_kind(cr_spec) == "pdengine":
+            return self._step_pd(readings, placement, cr_spec, physical,
+                                 bounds, now)
+        # CR currency flip mid-life (replica ↔ pdengine): the ledger's
+        # units have changed; drop the old PdShape and reseed from
+        # spec.replicas rather than compare it against an int bound.
+        if self.committed is not None and hasattr(self.committed, "prefill"):
+            self.reset_committed(cause="cr-type-flip")
         # Seed FIRST. spec.replicas is authoritative boot state; physical
         # is only needed for the *decision* phase below. A service whose
         # physical signal is missing must still appear on the wire with
@@ -194,6 +559,8 @@ class ServiceView:
                 want=self.committed if self.committed is not None else 0,
                 hold_reason=f"hold-no-physical-data physical={physical}",
                 skip=True,
+                pd_pool=None,
+                pd_shape=None,
             )
         mn, mx, _pri = bounds
 
@@ -368,7 +735,8 @@ class ServiceView:
         return verdicts, missing_slo
 
     def _transition(self, readings, verdicts, placement, physical, now,
-                    gates, phase, proposal, est, want, hold_reason):
+                    gates, phase, proposal, est, want, hold_reason,
+                    pd_shape=None):
         since_change = now - self.last_change_at
         comfort_s = None if self.comfortable_since is None else now - self.comfortable_since
         return Transition(
@@ -383,7 +751,17 @@ class ServiceView:
             phase=phase, proposal=proposal,
             est=est, want=want, hold_reason=hold_reason,
             skip=False,
+            pd_pool=None,
+            pd_shape=pd_shape,
         )
+
+
+def _fmt_committed(n):
+    """int for replica services; PdShape for pdengine. Log-friendly
+    one-liner so commit() can print either currency."""
+    if hasattr(n, "prefill") and hasattr(n, "decode"):
+        return f"{n.prefill}p{n.decode}d"
+    return str(n)
 
 
 def _hold_reason(flat_verdicts, gates, since_change_s, comfort_s):

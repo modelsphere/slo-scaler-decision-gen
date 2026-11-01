@@ -39,6 +39,21 @@ def phase_of(committed, physical):
     return Phase.SETTLED
 
 
+def phase_of_pd(committed, physical):
+    """Per-role phases for a PD service. Returns
+    {"prefill": Phase, "decode": Phase}.
+
+    `committed` / `physical` are 2-tuples (prefill, decode). Each role
+    runs the same RAMP_UP / IN_DRAIN / SETTLED algebra independently —
+    shedding decode while prefill is still ramping must not mask the
+    shed, and vice-versa.
+    """
+    return {
+        "prefill": phase_of(committed[0], physical[0]),
+        "decode":  phase_of(committed[1], physical[1]),
+    }
+
+
 def reconcile(proposed, committed, phase):
     """Return (replicas, reason).
 
@@ -51,3 +66,20 @@ def reconcile(proposed, committed, phase):
     if phase is Phase.RAMP_UP and proposed < committed:
         return committed, f"freeze-ramp-up proposed={proposed} committed={committed}"
     return proposed, ""
+
+
+def reconcile_pd(proposed, committed, phases):
+    """Per-role `reconcile`. `proposed` / `committed` are PdShapes,
+    `phases` the dict from `phase_of_pd`.
+
+    Each role runs its own symmetric freeze independently; a role that
+    is SETTLED passes through untouched even if its sibling is in
+    RAMP_UP or IN_DRAIN. Reasons are concatenated with `|` so log
+    parsers keep the `freeze-` prefix contract.
+    """
+    p_new, p_reason = reconcile(
+        proposed.prefill, committed.prefill, phases["prefill"])
+    d_new, d_reason = reconcile(
+        proposed.decode,  committed.decode,  phases["decode"])
+    reasons = [r for r in (p_reason, d_reason) if r]
+    return proposed.__class__(p_new, d_new, p_new + d_new), "|".join(reasons)

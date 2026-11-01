@@ -24,10 +24,55 @@ no `v` prefix; each tag publishes the image
   workloads for log tracing. Reading the DS requires `get/list/watch` on
   `disaggregatedsets.disaggregatedset.x-k8s.io` — RBAC is owned by the
   deployment chart.
+- PD engine scaling for CRs whose `maximumDeployment.type` is `pdengine`
+  (bounds in engines, not bundle replicas).
+  - A pdengine row in `/decisions` carries `shape.pd` alongside
+    `replicas.active` (the live `spec.slices`, which the autoscaler
+    never moves). The block pairs the committed per-slice prefill
+    and decode engine counts with the `liveReplicas` the DS spec is
+    currently running.
+  - The signal→role policy maps ttft violations to prefill growth,
+    otps violations to decode growth, rejection spikes to both roles at
+    the same multiplier, and a comfort shed to whichever role has the
+    larger SLO-margin; bounds violations are corrected at the live
+    P:D ratio (grow → ceil, shrink → floor, residual walked one
+    engine at a time, ties to decode).
+  - Physical engine counts come from
+    `bodylog_service_replicas_ready{..., role="prefill"|"decode"}`
+    once llm-openresty#26 adds the `role` label (an additional
+    series; the unlabelled total stays). Every other signal —
+    ttft, otps, rejection, request / rejection counts — stays
+    service-level.
+  - Inert until llm-openresty#26: without the `role` label the PD
+    branch holds at `hold-pd-no-role-physical` instead of freezing
+    blind — the per-role direction freeze can't see ramps/drains
+    otherwise. Boot-seed committed values still appear on the wire.
+  - Bounds violations are corrected at the live P:D ratio through
+    the same-ratio walk; there is no separate "compress to (1p,1d)"
+    path for small windows. A window too small to fit one engine
+    per role (per-slice `max < 2`) omits the service — emitted
+    as `hold-pdengine-bounds`.
+  - A CR whose `type` flips between `replica` and `pdengine`
+    reseeds the ledger from the placement rather than crash —
+    `serviceview.reset_committed` drops the foreign-currency value,
+    and the next tick boots from the workload's own shape.
+  - pdengine growth is booked against the pool's *leftover* after
+    replica services have been scheduled by the cross-service
+    planner (which is untouched here); the PD branch never
+    preempts a replica service's want. Sheds always land.
 
 ### Changed
 - GitHub Actions pinned to commit SHAs.
 - The README says where the released image is published.
+- Removing `maximumDeployment` from a listed service's CR drops the
+  service from `/decisions` on the next tick, instead of freezing it
+  at its last committed count. Adding `maximumDeployment` back
+  re-lists the service from a fresh boot seed (cooldowns restarted).
+  Prior behavior kept the service listed at its last count, which
+  read as "the scaler is still holding this" to consumers;
+  llm-operator treats a missing row as "hold replicas, mark
+  ScalingActive=False" and hands control back to the CR author.
+  Replica and pdengine services behave the same way here.
 - **Fix:** per-pod GPU accounting is now the *sum* of container
   `nvidia.com/gpu` limits, not the max. PD-colocate pods (prefill +
   decode engine containers sharing one pod, each requesting its own

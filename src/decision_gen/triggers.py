@@ -22,6 +22,7 @@ import math
 import os
 from collections import namedtuple
 
+from decision_gen import pd
 from decision_gen.thresholds import Verdict
 
 
@@ -47,8 +48,13 @@ R1B_MIN_REQUESTS      = _env_float("R1B_MIN_REQUESTS_5M",     20.0)   # over 5m
 # neither field — fire alarm is ungated — so neither may shut it off.
 Gates = namedtuple("Gates", ["up_cooldown_open", "shed_ready"])
 
-# Absolute target (P4). rule: 'r1a-fire' | 'r1b-steady' | 'r1c-shed'.
-# reason is human-readable, with numbers, for §8 logs.
+# Absolute target (P4). rule: 'r1a-fire' | 'r1b-steady' | 'r1c-shed',
+# or 'rjob-step-up' | 'rjob-shed' on the job path. `replicas` is an
+# int for replica/job proposals and a pd.PdShape for pdengine ones —
+# the PD axis is prefill/decode engines instead of bundles on n.
+# Signal → role is the policy: ttft speaks for prefill, otps for
+# decode, rejection for both. reason is human-readable, with
+# numbers, for §8 logs.
 Proposal = namedtuple("Proposal", ["replicas", "rule", "reason"])
 
 
@@ -165,6 +171,84 @@ def evaluate_job(verdicts, current, gates):
             replicas=current - step,
             rule="rjob-shed",
             reason=f"step=-{step}",
+        )
+    return None
+
+
+def evaluate_pd(verdicts, margins, rejection_rate, current, gates,
+                rejection_count=None, request_count=None):
+    """PD variant of `evaluate`. Works on engines, not bundles.
+
+    `current` is the live per-slice `pd.PdShape`. The same three rules
+    apply but move prefill/decode on their policy axes:
+        R1a fire            — service- level rejection, both roles scale
+                              together by the multiplier, floor +1 engine
+                              on each.
+        R1b ttft violated   — grow prefill by one step.
+        R1b otps violated   — grow decode by one step.
+        Both violated       — both grow (per-role step on the same engine
+                              count as the replica path).
+        R1c shed            — step comes off the role with the larger
+                              SLO comfort margin; ties go to the larger
+                              role, then decode. Role floors of 1 each.
+
+    Steps are the same fractions as the replica path
+    (`R1B_STEP_FRAC` / `R1C_STEP_FRAC`) applied against total engines
+    `p + d`, absolute (P4) as always.
+    """
+    E = current.engines
+    slo_violated = any(v is Verdict.VIOLATED for v in verdicts.values())
+
+    # R1a — ungated fire alarm; rejection is service-level, no role label,
+    # so both roles ride the multiplier.
+    if (rejection_rate is not None and rejection_rate >= REJECTION_THRESHOLD
+            and rejection_count is not None
+            and rejection_count >= R1A_MIN_REJECTIONS):
+        r = max(0.0, min(0.99, rejection_rate))
+        mult = 1.0 + (r / (1.0 - r)) * R1A_GAIN
+        mult = min(mult, R1A_CAP if slo_violated else R1A_CAP_CLEAN_SLO)
+        p = max(current.prefill + 1, math.ceil(current.prefill * mult))
+        d = max(current.decode + 1, math.ceil(current.decode * mult))
+        return Proposal(
+            replicas=pd.PdShape(p, d, p + d),
+            rule="r1a-fire",
+            reason=f"rej={rejection_rate:.4f} n={rejection_count:.0f} "
+                   f"mult={mult:.3f} cur={current.prefill}p{current.decode}d",
+        )
+
+    step = max(1, math.ceil(E * R1B_STEP_FRAC))
+    if gates.up_cooldown_open and slo_violated:
+        ttft_v = any(k.startswith("ttft.") and v is Verdict.VIOLATED
+                     for k, v in verdicts.items())
+        otps_v = any(k.startswith("otps.") and v is Verdict.VIOLATED
+                     for k, v in verdicts.items())
+        if request_count is None or request_count < R1B_MIN_REQUESTS:
+            return None
+        p = current.prefill + (step if ttft_v else 0)
+        d = current.decode + (step if otps_v else 0)
+        viol = sorted(k for k, v in verdicts.items() if v is Verdict.VIOLATED)
+        return Proposal(
+            replicas=pd.PdShape(p, d, p + d),
+            rule="r1b-steady",
+            reason=f"step=+{step} viol={viol} n={request_count:.0f}",
+        )
+
+    if gates.shed_ready and verdicts and all(
+            v is Verdict.COMFORTABLE for v in verdicts.values()):
+        if rejection_rate is None or rejection_rate >= REJECTION_OK_FLOOR:
+            return None
+        step = max(1, math.ceil(E * R1C_STEP_FRAC))
+        role = pd.pick_shed_role(current.prefill, current.decode, margins)
+        if role is None:
+            return None
+        taken = min(step, (current.prefill if role == "prefill"
+                           else current.decode) - 1)
+        p = current.prefill - (taken if role == "prefill" else 0)
+        d = current.decode - (taken if role == "decode" else 0)
+        return Proposal(
+            replicas=pd.PdShape(p, d, p + d),
+            rule="r1c-shed",
+            reason=f"step=-{taken} role={role} rej={rejection_rate:.4f}",
         )
     return None
 

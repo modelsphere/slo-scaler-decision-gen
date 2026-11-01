@@ -28,9 +28,13 @@ info:
 
     - A CR with no `maximumDeployment` has opted out of autoscaling, and its
       service is not added to the list.
-    - A service already listed stays listed at its last count if its CR loses
-      `maximumDeployment` or its workload stops resolving, until the CR is
-      deleted.
+    - A service whose CR loses `maximumDeployment` has opted out of
+      autoscaling and is removed from the next list. Adding
+      `maximumDeployment` back re-lists it from the workload's
+      current spec value (a fresh boot seed, with cooldowns
+      restarted).
+    - A service already listed stays listed at its last count if its
+      workload stops resolving, until the CR is deleted.
     - A service whose workload has no ready replicas this tick stays listed at
       its last count.
     - A tick that fails leaves the previous list in place.
@@ -53,6 +57,73 @@ info:
     move. Only the string changes; the shape stays. decision-gen switches only
     after llm-operator and swissd accept both, so a consumer should accept both
     values from now on.
+
+    ## PD (pdengine) decisions
+
+    A `LLMSLORequirement` whose `maximumDeployment.type` is `pdengine` bounds
+    a PD-disaggregated service in *engines* — prefill plus decode replicas —
+    rather than bundles. decision-gen never moves `spec.slices`; it only
+    adjusts the per-slice prefill/decode pair. For such services the
+    decision row is additive:
+
+    ```json
+    {
+      "namespace": "test-dsset",
+      "serviceId": "vllm-qwen36-2p1d",
+      "replicas": { "active": 1 },
+      "shape": {
+        "pd": {
+          "prefill": { "replicas": 2, "liveReplicas": 2 },
+          "decode":  { "replicas": 1, "liveReplicas": 1 },
+          "slices": 1
+        }
+      }
+    }
+    ```
+
+    · `replicas.active` is the live slice count (n) — it never changes.
+    · `shape.pd` is the committed per-slice shape the consumer applies.
+    · `liveReplicas` are what the DS spec is running right now; consumers
+      that only need the target can ignore them.
+    · A pdengine row whose DS is transiently unreadable keeps its
+      last-resolved `liveReplicas` (never `null`).
+
+    `shape` never appears on replica-typed rows; consumers that don't
+    care about PD can keep reading `replicas.active` and ignore it.
+
+    A pdengine service is **omitted** from `/decisions` when:
+
+    - Its CR has opted out (no `maximumDeployment`) — same as a
+      replica service.
+    - The workload isn't a DisaggregatedSet whose GPU roles are
+      exactly `{prefill, decode}`.
+    - The DS has `spec.slices != 1` (pdengine policy is single-slice
+      only — the scaler never moves `slices`).
+    - The per-slice CR window can't fit one engine of each role —
+      that's `max < 2` (`max = 1` keeps the DS at 1 prefill +
+      1 decode = 2 engines → inexpressible).
+
+    Any other out-of-window shape is corrected at the live P:D ratio
+    through the usual same-ratio walk (grow → ceil, shrink → floor),
+    never omitted. The "compress to (1 prefill, 1 decode)" branch
+    fires only when the DS itself runs zero engines — an unreadable
+    state the DS can't really be in, so it's loud (error-level log),
+    keeps the row alive at (1,1) rather than vanishing.
+
+    A pdengine service stays **inert in production** until the
+    upstream bodylog exporter (llm-openresty#26) emits the
+    `role="prefill"|"decode"` label — the scheduler-side role-
+    level freeze can't see ramps/drains without it and the PD
+    branch holds at `hold-pd-no-role-physical`. Once that lands,
+    growth is booked against the pool's leftover after replica
+    services have scheduled; pdengine services do not yet
+    participate in cross-service priority preemption (follow-up).
+
+    A pdengine service whose CR loses `maximumDeployment` is removed
+    from the list on the next tick (same as a replica service).
+    A pdengine service whose DS stops resolving stays listed at
+    its last committed shape, with `shape.pd` carrying the PDSpec
+    the controller last resolved — not a null block.
 
     ## Authentication
 
@@ -187,7 +258,49 @@ components:
               minimum: 0
               description: |
                 How many replicas to run, within the CR's minimum and maximum. For
-                a DisaggregatedSet, a replica is one slice.
+                a DisaggregatedSet, a replica is one slice. On a pdengine row
+                this mirrors the live slice count (n), which the autoscaler
+                never moves.
+        shape:
+          type: object
+          description: |
+            Optional. Present only on rows for CRs whose
+            `maximumDeployment.type` is `pdengine`. Consumers that don't
+            understand PD can ignore the whole block; the load-bearing
+            number is still `replicas.active`.
+          properties:
+            pd:
+              type: object
+              required: [slices, prefill, decode]
+              properties:
+                slices:
+                  type: integer
+                  minimum: 1
+                  description: Live `spec.slices`; informational.
+                prefill:
+                  type: object
+                  required: [replicas, liveReplicas]
+                  properties:
+                    replicas:
+                      type: integer
+                      minimum: 0
+                      description: Committed prefill engines per slice.
+                    liveReplicas:
+                      type: integer
+                      minimum: 0
+                      description: What the DS spec is running today.
+                decode:
+                  type: object
+                  required: [replicas, liveReplicas]
+                  properties:
+                    replicas:
+                      type: integer
+                      minimum: 0
+                      description: Committed decode engines per slice.
+                    liveReplicas:
+                      type: integer
+                      minimum: 0
+                      description: What the DS spec is running today.
 
     Status:
       type: object
