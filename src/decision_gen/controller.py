@@ -30,9 +30,9 @@ import logging
 import threading
 import time
 
-from decision_gen import planner, snapshot as wire
+from decision_gen import pd, planner, snapshot as wire
 from decision_gen.serviceview import (
-    ServiceView, _bounds, _bounds_kind,
+    ServiceView, _bounds, _bounds_kind, _fmt_committed,
 )
 from decision_gen.thresholds import Verdict
 
@@ -63,6 +63,9 @@ class Controller:
         self._lock = threading.Lock()
         self._snapshot = wire.to_wire({})
         self._views = {}        # (ns, svc) → ServiceView
+        self._pd_specs = {}     # (ns, svc) → PDSpec — last resolved
+                                # for a pdengine CR; survives ticks
+                                # whose placement read fails.
         self._stop = threading.Event()
         self._has_ticked = threading.Event()    # set after first tick attempt
         self._thread = None
@@ -150,6 +153,7 @@ class Controller:
             if key in crs or key in crs_job:
                 continue
             del self._views[key]
+            self._pd_specs.pop(key, None)
             log.info("%s/%s: CR deleted; freed ledger entry", *key)
 
         # Merge both kinds into one iteration. Placement, bounds,
@@ -177,8 +181,9 @@ class Controller:
         placements = {}    # {(ns,svc): (pool, gpr)}
         bounds = {}        # {(ns,svc): {'min','max','priority'}}
         views = {}
-        pd_placements = {} # {(ns,svc): Placement} — pdengine only
-        pd_bookings = {}   # {(ns,svc): PdShape} — pdengine only
+        pd_wants = {}      # {(ns,svc): (PdShape, Placement)} — growth
+                           # candidates; the placement supplies pool +
+                           # role_group_gpus for the leftover math
 
         for (ns, svc), spec, cr_kind in merged:
             key = (ns, svc)
@@ -192,6 +197,11 @@ class Controller:
                     "(not autoscaled); skipping every tick until set",
                     ns, svc,
                 )
+                # Opt-out CR on a service we were managing: drop the
+                # ledger row, and clean up any cached pdengine spec so
+                # the wire doesn't keep serving a stale shape.
+                self._views.pop(key, None)
+                self._pd_specs.pop(key, None)
                 continue
 
             placement = self.k8s.resolve_placement(ns, svc)
@@ -231,21 +241,16 @@ class Controller:
             if view is None:
                 view = ServiceView(ns, svc)
                 self._views[key] = view
-            # pdengine services need placement.pd available even on
-            # transient skip ticks so the wire can keep serving the
-            # last committed shape; it only changes via the success
-            # path but the read happens before `continue` below.
-            # Gate on the CR kind — a replica-typed CR on a DS
-            # workload must NOT populate pd_placements (to_wire would
-            # then try to render an int as a PdShape).
-            if (_bounds_kind(spec) == "pdengine"
-                    and placement.pd is not None):
-                pd_placements[key] = placement
+            # Persist the pd spec for wire rendering whenever the
+            # placement resolves — a bodylog lull or a later failed
+            # resolve must not put nulls (or worse, crash) in shape.pd.
+            pd_kind = _bounds_kind(spec) == "pdengine"
+            if pd_kind and placement.pd is not None:
+                self._pd_specs[key] = placement.pd
 
             t = view.step(readings, placement, spec, physical_val, now,
                           kind=cr_kind)
             transitions.append(t)
-            pd_kind = _bounds_kind(spec) == "pdengine"
             if t.skip:
                 # Transient skip → serve the last committed shape on the
                 # wire, same posture as the replica path. Structural
@@ -256,21 +261,21 @@ class Controller:
                     self._drop_pd_view(key)
                 continue
 
-            if pd_kind:
-                # pdengine services bypass the cross-service planner:
-                # engines are exchanged inside the sandwich, bundles
-                # are not. The want is already bounds-valid — commit
-                # goes through the single mutation path. Book the
-                # committed GPU spend against the pool ledger *after*
-                # the replica loop below, so the planner never sees a
-                # PdShape in its inputs.
-                view.commit(t.pd_shape, now, cause="pd-engine")
-                views[key] = view
-                pd_bookings[key] = view.committed
-                continue
-
             mn, mx, pri = _bounds(spec)
             views[key] = view
+
+            if pd_kind:
+                # pdengine services bypass the cross-service planner:
+                # the replica path owns priority preemption today;
+                # pdengine growth rides on whatever the replicas
+                # leave behind (see step 6 below). Sheds always go
+                # through. The want is already bounds- and
+                # direction-valid by `_step_pd`; pool-ledger accounting
+                # references this service's *committed* shape, not its
+                # want.
+                pd_wants[key] = (t.pd_shape, placement)
+                continue
+
             wants[key] = t.want
             booked[key] = view.committed
             placements[key] = (placement.pool, placement.gpus_per_replica)
@@ -279,52 +284,82 @@ class Controller:
         # 3b. Warn loudly when Σ min × per-unit > capacity for any pool —
         # mins are CR authority and we will honor them regardless, but
         # the scheduler cannot place what doesn't fit; pods will go
-        # Pending. Replica services pay `min × gpr-per-replica`. PD
-        # services pay committed engines × per-group GPUs — engines are
-        # the unit on the CR and bundle_gpus is what one slice costs.
+        # Pending. Replica services book `min × gpr-per-replica`;
+        # pdengine services book their *committed* shape — the planner
+        # doesn't grow them, so the floor is what they're holding.
         min_needed = {}
         for key, b in bounds.items():
             pool, gpr = placements[key]
             min_needed[pool] = min_needed.get(pool, 0) + b["min"] * gpr
-        for key, n in pd_bookings.items():
-            pool, pd_spec = (pd_placements[key].pool,
-                             pd_placements[key].pd)
-            cost = (n.prefill * pd_spec.role_group_gpus["prefill"]
-                    + n.decode * pd_spec.role_group_gpus["decode"])
-            min_needed[pool] = min_needed.get(pool, 0) + cost
         for pool, need in min_needed.items():
             have = capacity.get(pool, 0)
             if need > have:
                 log.warning(
-                    "pool %s UNDER-PROVISIONED: Σ CR min × gpr = %d GPUs "
-                    "but pool capacity = %d (short %d). Honoring mins "
-                    "anyway; kube-scheduler will mark excess pods Pending.",
+                    "pool %s UNDER-PROVISIONED: Σ per-service floor "
+                    "× unit cost = %d GPUs but pool capacity = %d "
+                    "(short %d). Honoring mins anyway; kube-scheduler "
+                    "will mark excess pods Pending.",
                     pool, need, have, need - have,
                 )
 
         # 4. Ledger gap: Σ ready GPUs − Σ committed × per-unit cost.
-        # Replica bookings go through the planner's bookkeeping; pd
-        # bookings land here directly.
+        # Replica bookings go through the planner; pd bookings land here.
         gap = dict(capacity)
         for key, n in booked.items():
             pool, gpr = placements[key]
             gap[pool] = gap.get(pool, 0) - n * gpr
-        for key, n in pd_bookings.items():
-            pool, pd_spec = (pd_placements[key].pool,
-                             pd_placements[key].pd)
-            cost = (n.prefill * pd_spec.role_group_gpus["prefill"]
-                    + n.decode * pd_spec.role_group_gpus["decode"])
-            gap[pool] = gap.get(pool, 0) - cost
+        for key, (_want, placed) in pd_wants.items():
+            view = views[key]
+            gap[placed.pool] = gap.get(placed.pool, 0) - pd.shape_gpu_cost(
+                view.committed, placed.pd.role_group_gpus)
         log.info("pool gap after booking: %s", gap)
 
-        # 5. Planner arbiters capacity. Output is final (R8).
+        # 5. Planner arbiters capacity. Replica/job only — pdengine
+        # wants don't enter. Output is final (R8).
         alloc = planner.resolve(
             wants=wants, current=booked,
             placement=placements, cr=bounds, gap=gap,
         )
 
-        # 6. Commit through the only mutation path; emit log rows;
-        #    swap the served snapshot atomically.
+        # 6. Commit through the only mutation path. Replicas first;
+        # pdengine growth is granted out of the pool's post-alloc
+        # leftover, never contested against a replica want. Sheds
+        # (want.engines < committed.engines) are always allowed —
+        # the leftover check only guards growth.
+        leftover = dict(gap)
+        for key, n in alloc.items():
+            pool, gpr = placements[key]
+            booked_n = booked.get(key, 0)
+            growth = n - booked_n
+            if growth > 0:
+                leftover[pool] = leftover.get(pool, 0) - growth * gpr
+        # Transitions were built before the ledger ran; annotate the
+        # outcome so `tick ns/svc ... want=...` always agrees with the
+        # committed value that actually lands.
+        transitions_by_key = {(t.ns, t.service): t for t in transitions}
+        for key, (want, placed) in pd_wants.items():
+            view = views[key]
+            t = transitions_by_key.get(key)
+            delta = pd.PdShape(
+                max(0, want.prefill - view.committed.prefill),
+                max(0, want.decode - view.committed.decode),
+                0,
+            )
+            need = pd.shape_gpu_cost(delta, placed.pd.role_group_gpus)
+            free = leftover.get(placed.pool, 0)
+            if need <= free:
+                view.commit(want, now, cause="pd-engine")
+                leftover[placed.pool] = free - need
+            else:
+                hold = (f"hold-pd-no-capacity need={need} "
+                        f"free={free}")
+                log.info("%s/%s: pd-engine %s; keeping %s",
+                         key[0], key[1], hold,
+                         _fmt_committed(view.committed))
+                if t is not None:
+                    transitions[transitions.index(t)] = t._replace(
+                        want=view.committed, pd_shape=view.committed,
+                        hold_reason=hold)
         for key, n in sorted(alloc.items()):
             views[key].commit(n, now, cause="planner")
 
@@ -335,14 +370,16 @@ class Controller:
         # a temporarily-no-physical service must not vanish from the wire
         # (the executor would read absence differently from "same value").
         # pdengine views that skipped this tick have already been
-        # dropped from self._views by _drop_pd_view above.
+        # dropped from self._views by _drop_pd_view above. A pdengine
+        # row whose DS is unreadable renders against the PDSpec the
+        # controller last resolved, not nulls.
         committed = {
             key: v.committed
             for key, v in self._views.items()
             if v.committed is not None      # never-seeded: nothing to serve
         }
         with self._lock:
-            self._snapshot = wire.to_wire(committed, pd_placements)
+            self._snapshot = wire.to_wire(committed, self._pd_specs)
         log.info(
             "tick: %s",
             "; ".join(f"{k[0]}/{k[1]}={_fmt_committed(n)}"
@@ -350,22 +387,18 @@ class Controller:
         )
 
     def _drop_pd_view(self, key):
-        """Drop a pdengine view after a skip/hold. The next tick re-seeds
-        the view from the live DS spec, so the wire never serves a
-        bound-breaking or stale shape."""
+        """Drop a pdengine view after a structural-skip transition.
+
+        Structural skips carry `pd_shape=None` (non-ds, slices != 1,
+        inexpressible bounds); the next tick re-seeds the view from the
+        live DS spec, so the wire never serves a bound-breaking or
+        stale shape. Transient skips (`physical` down) leave the view
+        alone."""
         view = self._views.pop(key, None)
+        self._pd_specs.pop(key, None)
         if view is not None and view.committed is not None:
-            log.info("%s/%s: pdengine skip; dropping committed %s",
-                     key[0], key[1], view.committed)
-
-
-def _fmt_committed(n):
-    """int for replica services; PdShape for pdengine. Log-friendly
-    one-liner so the `tick: ns/svc=...` line doesn't blow up on the
-    object repr."""
-    if hasattr(n, "prefill") and hasattr(n, "decode"):
-        return f"{n.prefill}p{n.decode}d"
-    return str(n)
+            log.info("%s/%s: pdengine structural skip; dropping committed %s",
+                     key[0], key[1], _fmt_committed(view.committed))
 
 
 def _fmt_transition(t):

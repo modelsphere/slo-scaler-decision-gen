@@ -48,16 +48,14 @@ R1B_MIN_REQUESTS      = _env_float("R1B_MIN_REQUESTS_5M",     20.0)   # over 5m
 # neither field — fire alarm is ungated — so neither may shut it off.
 Gates = namedtuple("Gates", ["up_cooldown_open", "shed_ready"])
 
-# Absolute target (P4). rule: 'r1a-fire' | 'r1b-steady' | 'r1c-shed'.
-# reason is human-readable, with numbers, for §8 logs.
+# Absolute target (P4). rule: 'r1a-fire' | 'r1b-steady' | 'r1c-shed',
+# or 'rjob-step-up' | 'rjob-shed' on the job path. `replicas` is an
+# int for replica/job proposals and a pd.PdShape for pdengine ones —
+# the PD axis is prefill/decode engines instead of bundles on n.
+# Signal → role is the policy: ttft speaks for prefill, otps for
+# decode, rejection for both. reason is human-readable, with
+# numbers, for §8 logs.
 Proposal = namedtuple("Proposal", ["replicas", "rule", "reason"])
-
-# PD variant: `replicas` is a pd.PdShape (per-slice engine counts),
-# never an int. The trigger evaluator works exactly like the
-# replica-typed one but moves engines on the prefill/decode axis
-# instead of bundles on the n axis. Signal → role is the policy:
-# ttft speaks for prefill, otps for decode, rejection for both.
-PdProposal = namedtuple("PdProposal", ["replicas", "rule", "reason"])
 
 
 def fire_alarm(rejection_rate, current, rejection_count=None, slo_violated=False):
@@ -211,7 +209,7 @@ def evaluate_pd(verdicts, margins, rejection_rate, current, gates,
         mult = min(mult, R1A_CAP if slo_violated else R1A_CAP_CLEAN_SLO)
         p = max(current.prefill + 1, math.ceil(current.prefill * mult))
         d = max(current.decode + 1, math.ceil(current.decode * mult))
-        return PdProposal(
+        return Proposal(
             replicas=pd.PdShape(p, d, p + d),
             rule="r1a-fire",
             reason=f"rej={rejection_rate:.4f} n={rejection_count:.0f} "
@@ -229,7 +227,7 @@ def evaluate_pd(verdicts, margins, rejection_rate, current, gates,
         p = current.prefill + (step if ttft_v else 0)
         d = current.decode + (step if otps_v else 0)
         viol = sorted(k for k, v in verdicts.items() if v is Verdict.VIOLATED)
-        return PdProposal(
+        return Proposal(
             replicas=pd.PdShape(p, d, p + d),
             rule="r1b-steady",
             reason=f"step=+{step} viol={viol} n={request_count:.0f}",
@@ -247,7 +245,7 @@ def evaluate_pd(verdicts, margins, rejection_rate, current, gates,
                            else current.decode) - 1)
         p = current.prefill - (taken if role == "prefill" else 0)
         d = current.decode - (taken if role == "decode" else 0)
-        return PdProposal(
+        return Proposal(
             replicas=pd.PdShape(p, d, p + d),
             rule="r1c-shed",
             reason=f"step=-{taken} role={role} rej={rejection_rate:.4f}",

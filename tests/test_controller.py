@@ -282,7 +282,7 @@ def test_warns_when_pool_cannot_fit_all_mins(
     warned = [r.getMessage() for r in caplog.records if "UNDER-PROVISIONED" in r.getMessage()]
     assert warned, "expected a loud warning when mins exceed pool capacity"
     msg = warned[0]
-    assert "16 GPUs" in msg and "capacity = 8" in msg and "short 8" in msg
+    assert "= 16 GPUs" in msg and "capacity = 8" in msg and "short 8" in msg
 
 
 def test_missing_max_keeps_service_off_wire(

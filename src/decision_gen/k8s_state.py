@@ -70,23 +70,9 @@ class PDSpec:
     prefill: int               # prefill engine groups per slice
     decode: int                # decode engine groups per slice
     # GPUs per engine group, per role — routers and other CPU-only
-    # roles are absent. {"prefill": 8, "decode": 8} on a 2P1D H100 DS.
-    role_group_gpus: dict = None
-
-    def bundle_gpus(self):
-        """GPUs in one slice: Σ over GPU-requesting roles of
-        groups × per-group GPUs. A role contributes only when its
-        engines per slice is nonzero; roles like the router never
-        enter `role_group_gpus` at all."""
-        total = 0
-        for role, gpus in self.role_group_gpus.items():
-            v = getattr(self, role, 0)
-            total += v * gpus
-        return total
-
-    def engines_live(self):
-        """Total engine groups across all slices (prefill + decode)."""
-        return self.slices * (self.prefill + self.decode)
+    # roles are absent. Required: the DS placement extractor always
+    # fills it when it builds a PDSpec.
+    role_group_gpus: dict
 
 
 @dataclass(frozen=True)

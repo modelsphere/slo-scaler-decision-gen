@@ -28,9 +28,13 @@ info:
 
     - A CR with no `maximumDeployment` has opted out of autoscaling, and its
       service is not added to the list.
-    - A service already listed stays listed at its last count if its CR loses
-      `maximumDeployment` or its workload stops resolving, until the CR is
-      deleted.
+    - A service whose CR loses `maximumDeployment` has opted out of
+      autoscaling and is removed from the next list. Adding
+      `maximumDeployment` back re-lists it from the workload's
+      current spec value (a fresh boot seed, with cooldowns
+      restarted).
+    - A service already listed stays listed at its last count if its
+      workload stops resolving, until the CR is deleted.
     - A service whose workload has no ready replicas this tick stays listed at
       its last count.
     - A tick that fails leaves the previous list in place.
@@ -81,15 +85,45 @@ info:
     · `shape.pd` is the committed per-slice shape the consumer applies.
     · `liveReplicas` are what the DS spec is running right now; consumers
       that only need the target can ignore them.
+    · A pdengine row whose DS is transiently unreadable keeps its
+      last-resolved `liveReplicas` (never `null`).
 
     `shape` never appears on replica-typed rows; consumers that don't
     care about PD can keep reading `replicas.active` and ignore it.
 
-    A service whose bounds go below the ≥1-per-role floor (min = max ≤ 2
-    engines per slice) is compressed to `(1 prefill, 1 decode)` — the
-    smallest liveable PD shape — and logged at error level, never
-    omitted. Omission happens only when the DS itself is unreachable
-    or the bounds window is mathematically empty.
+    A pdengine service is **omitted** from `/decisions` when:
+
+    - Its CR has opted out (no `maximumDeployment`) — same as a
+      replica service.
+    - The workload isn't a DisaggregatedSet whose GPU roles are
+      exactly `{prefill, decode}`.
+    - The DS has `spec.slices != 1` (pdengine policy is single-slice
+      only — the scaler never moves `slices`).
+    - The per-slice CR window can't fit one engine of each role —
+      that's `max < 2` (`max = 1` keeps the DS at 1 prefill +
+      1 decode = 2 engines → inexpressible).
+
+    Any other out-of-window shape is corrected at the live P:D ratio
+    through the usual same-ratio walk (grow → ceil, shrink → floor),
+    never omitted. The "compress to (1 prefill, 1 decode)" branch
+    fires only when the DS itself runs zero engines — an unreadable
+    state the DS can't really be in, so it's loud (error-level log),
+    keeps the row alive at (1,1) rather than vanishing.
+
+    A pdengine service stays **inert in production** until the
+    upstream bodylog exporter (llm-openresty#26) emits the
+    `role="prefill"|"decode"` label — the scheduler-side role-
+    level freeze can't see ramps/drains without it and the PD
+    branch holds at `hold-pd-no-role-physical`. Once that lands,
+    growth is booked against the pool's leftover after replica
+    services have scheduled; pdengine services do not yet
+    participate in cross-service priority preemption (follow-up).
+
+    A pdengine service whose CR loses `maximumDeployment` is removed
+    from the list on the next tick (same as a replica service).
+    A pdengine service whose DS stops resolving stays listed at
+    its last committed shape, with `shape.pd` carrying the PDSpec
+    the controller last resolved — not a null block.
 
     ## Authentication
 

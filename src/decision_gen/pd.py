@@ -29,6 +29,73 @@ PdShape = namedtuple("PdShape", ["prefill", "decode", "engines"])
 RoleMargins = namedtuple("RoleMargins", ["prefill", "decode"])
 
 
+def shape_gpu_cost(shape, role_group_gpus):
+    """GPUs a PdShape costs given per-role engine-group sizes.
+
+    Heterogeneous role groups (e.g. prefill TP4 / decode TP8) work
+    naturally — the controller charges each role at its own rate.
+    """
+    return (shape.prefill * role_group_gpus["prefill"]
+            + shape.decode * role_group_gpus["decode"])
+
+
+def trim_growth_to_cap(proposal, committed, cap):
+    """Pull a bound-crossing *growth* back so est fits `cap`.
+
+    Removes `proposal.engines - cap` engines, taken from the roles
+    the proposal grew (larger increment shed first; a tie sheds
+    decode). Never takes a role below its committed value — the
+    sibling role's existing engines are untouched. Returns the
+    trimmed PdShape *at* the cap, or `committed` when the proposal's
+    own delta doesn't cover the overshoot (committed was already
+    out of window — the bounds-fix path owns that case).
+    """
+    over = proposal.engines - cap
+    if over <= 0:
+        return proposal
+    gp = proposal.prefill - committed.prefill
+    gd = proposal.decode - committed.decode
+    if gp + gd < over:
+        return committed
+    while over > 0:
+        if gd >= gp and gd > 0:
+            gd -= 1
+        elif gp > 0:
+            gp -= 1
+        else:
+            break
+        over -= 1
+    return _mk(committed.prefill + gp, committed.decode + gd)
+
+
+def pad_shed_to_floor(proposal, committed, floor):
+    """Push a floor-crossing *shed* back up so est fits `floor`.
+
+    Returns `floor - proposal.engines` engines to the role the
+    proposal shed from (the role that sits furthest below its
+    committed level; a tie returns to decode). Never returns a
+    role above its committed value. Returns the padded PdShape
+    *at* the floor, or `committed` when the proposal's own delta
+    doesn't cover the shortfall.
+    """
+    under = floor - proposal.engines
+    if under <= 0:
+        return proposal
+    sp = committed.prefill - proposal.prefill
+    sd = committed.decode - proposal.decode
+    if sp + sd < under:
+        return committed
+    while under > 0:
+        if sd >= sp and sd > 0:
+            sd -= 1
+        elif sp > 0:
+            sp -= 1
+        else:
+            break
+        under -= 1
+    return _mk(committed.prefill - sp, committed.decode - sd)
+
+
 def _mk(prefill, decode):
     return PdShape(int(prefill), int(decode), int(prefill) + int(decode))
 
@@ -67,9 +134,11 @@ def correct_to_bounds(prefill, decode, engines_min, engines_max):
     equal shapes resolve deterministically).
 
     Inexpressible shapes return None and the caller must *skip the
-    service* rather than emit a bound-violating row — the residual
-    walk never breaks the ≥1 floor, so e.g. an odd bound against a
-    1:1 ratio refuses instead of landing at n+1.
+    service* rather than emit a bound-violating row. The residual
+    walk never breaks the ≥1 floor, so a shape can only fail when the
+    bound leaves no room for it — e.g. an odd bound against a 1:1
+    ratio walks one engine off the pair and lands; a bound below 2
+    (below the pair's floor) refuses.
     """
     E = int(prefill) + int(decode)
     mn, mx = int(engines_min), int(engines_max)

@@ -53,6 +53,7 @@ class FakeSignals:
         self.rejection_count_val = None
         self.request_count_val = None
         self.replicas_ready_val = None
+        self.replicas_ready_overrides = {}  # {(ns, svc): value | Reading}
         self.replicas_ready_role_val = {}  # {role: value | Reading}
         self.queue_depth_overrides = {}    # {(ns, svc): value | Reading}
         self.queue_depth_default = None    # fallback when no override
@@ -91,7 +92,8 @@ class FakeSignals:
 
     def replicas_ready(self, ns, svc):
         self.calls.append(("replicas_ready", ns, svc))
-        return self._wrap(self.replicas_ready_val)
+        v = self.replicas_ready_overrides.get((ns, svc), self.replicas_ready_val)
+        return self._wrap(v)
 
     def replicas_ready_role(self, ns, svc, role):
         self.calls.append(("replicas_ready_role", ns, svc, role))
@@ -125,8 +127,11 @@ class FakeSignals:
     def set_rejection(self, value):
         self.rejection_val = value
 
-    def set_replicas_ready(self, value):
-        self.replicas_ready_val = value
+    def set_replicas_ready(self, value, ns=None, svc=None):
+        if ns is None:
+            self.replicas_ready_val = value
+        else:
+            self.replicas_ready_overrides[(ns, svc)] = value
 
 
 class FakeK8sState:
