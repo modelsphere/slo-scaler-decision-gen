@@ -8,6 +8,32 @@ no `v` prefix; each tag publishes the image
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-11-04
+
+### Fixed
+- `replicas_ready` reads only `role=~"|router"`. bodylog-exporter 0.2.13 splits
+  a PD release's series by role, so the unfiltered query returned
+  max(router, prefill, decode). A replica-typed CR on a DisaggregatedSet then
+  read as permanently in drain and could not scale up. Upgrade to this release
+  before upgrading the exporter; it also works against older exporters.
+- A workload with no GPU-product pin is booked against the cluster's largest
+  pool that has a schedulable GPU, by GPUs, not always H100. On a cluster with
+  no H100 it was booked against a pool with no capacity and could not grow.
+  **On a mixed cluster whose largest pool is not H100, unpinned services move
+  to that pool on upgrade.** Set `DEFAULT_GPU_POOL` to keep a fixed pool; it
+  still wins, and now follows the H800 alias like every other pool name.
+- A GPU-product `nodeSelector` counts as a pin; only node affinity did before.
+- An unpinned LWS leader or worker, or DisaggregatedSet role, follows its pinned
+  siblings instead of making the workload unmanageable.
+
+### Changed
+- PD engine scaling is live on a cluster running bodylog-exporter 0.2.13 or
+  newer (chart `bodylog-exporter` 0.3.6, which grants `list` on
+  leaderworkersets): pdengine services stop holding at
+  `hold-pd-no-role-physical` and scale on their SLOs. The 0.8.0 notes below
+  predate that exporter: it has no unlabelled total for a PD release, whose
+  service-level series is `role="router"`.
+
 ## [0.8.0] - 2026-11-01
 
 ### Added
@@ -122,7 +148,8 @@ First tagged release.
 - The Dockerfile's base image and PyPI index are build args that default to
   the public ones.
 
-[Unreleased]: https://github.com/modelsphere/slo-scaler-decision-gen/compare/0.8.0...HEAD
+[Unreleased]: https://github.com/modelsphere/slo-scaler-decision-gen/compare/0.8.1...HEAD
+[0.8.1]: https://github.com/modelsphere/slo-scaler-decision-gen/compare/0.8.0...0.8.1
 [0.8.0]: https://github.com/modelsphere/slo-scaler-decision-gen/compare/0.7.0...0.8.0
 [0.7.0]: https://github.com/modelsphere/slo-scaler-decision-gen/compare/0.6.0...0.7.0
 [0.6.0]: https://github.com/modelsphere/slo-scaler-decision-gen/releases/tag/0.6.0

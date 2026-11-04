@@ -37,7 +37,11 @@ GPU_LIMIT_KEY = "nvidia.com/gpu"
 GPU_PRODUCT_LABEL = "nvidia.com/gpu.product"
 GPU_PRESENT_LABEL = "nvidia.com/gpu.present"
 
-DEFAULT_GPU_POOL = os.environ.get("DEFAULT_GPU_POOL", "NVIDIA-H100-80GB-HBM3")
+# Pool for a workload with no GPU-product pin. Set: always that pool. Unset:
+# the cluster's largest pool, see K8sState._default_pool.
+DEFAULT_GPU_POOL = os.environ.get("DEFAULT_GPU_POOL")
+# Only until the first pool_capacity() has seen a GPU node.
+FALLBACK_GPU_POOL = "NVIDIA-H100-80GB-HBM3"
 
 # TEMP-REVERT — H800-as-H100 pool merge. To revoke: delete POOL_ALIASES
 # and the `_canonical_pool()` indirection below (revert to direct product
@@ -93,6 +97,8 @@ class Placement:
     # GPU-requesting roles are exactly {prefill, decode}. None on every
     # other workload — pdengine-typed CRs refuse such placements.
     pd: "PDSpec | None" = None
+    # The pool came from the default rule, not from a pin on the workload.
+    pool_defaulted: bool = False
 
     def member_workloads(self):
         """Return the (kind, name) tuple list. Defaults to the single-workload
@@ -112,6 +118,13 @@ def _to_dict(obj):
     return {}
 
 
+def _settled_pools(places):
+    """The pools a bundle's templates agree on. An unpinned template runs
+    wherever its pinned siblings do, so it has no say while there are any."""
+    pinned = {p.pool for p in places if not p.pool_defaulted}
+    return pinned or {p.pool for p in places}
+
+
 class K8sState:
     # Hardcoded aliases: (namespace, service_id) -> workload name.
     # Consulted first during resolution. Remove as the cluster fixes
@@ -125,6 +138,7 @@ class K8sState:
         self._apps = apps_v1
         self._core = core_v1
         self._custom = custom_v1
+        self._largest_pool = None  # refreshed by pool_capacity
 
     # ---------- lazy api construction ----------
 
@@ -319,7 +333,7 @@ class K8sState:
                         namespace, ds_name)
             return None
 
-        pools = set()
+        places = []
         gpus_per_slice = 0
         members = []
         role_engines = {}        # name -> spec.replicas (engine groups / slice)
@@ -358,7 +372,7 @@ class K8sState:
                     namespace, ds_name, role_name,
                 )
                 return None
-            if leader_place.pool != worker_place.pool:
+            if len(_settled_pools((leader_place, worker_place))) != 1:
                 log.warning(
                     "DS %s/%s role=%s leader/worker pools disagree (%s vs %s)",
                     namespace, ds_name, role_name,
@@ -373,13 +387,14 @@ class K8sState:
                 )
                 return None
 
-            pools.add(leader_place.pool)
+            places += [leader_place, worker_place]
             per_group = lwt_size * leader_place.gpus_per_replica
             gpus_per_slice += role_replicas * per_group
             role_engines[role_name] = role_replicas
             role_group_gpus[role_name] = per_group
             members.append(("lws", f"{ds_name}-{role_name}"))
 
+        pools = _settled_pools(places)
         if len(pools) != 1:
             log.warning(
                 "DS %s/%s roles span multiple pools %s; unmanageable",
@@ -443,7 +458,8 @@ class K8sState:
         )
         if leader_place is None or worker_place is None:
             return None
-        if leader_place.pool != worker_place.pool:
+        pools = _settled_pools((leader_place, worker_place))
+        if len(pools) != 1:
             log.warning(
                 "LWS %s/%s leader/worker pools disagree (%s vs %s); unmanageable",
                 namespace, workload_name, leader_place.pool, worker_place.pool,
@@ -458,7 +474,7 @@ class K8sState:
             return None
         return Placement(
             namespace=namespace, name=workload_name, kind="lws",
-            pool=leader_place.pool,
+            pool=next(iter(pools)),
             gpus_per_replica=size * per_pod,
             workload_name=workload_name,
             spec_replicas=replicas,
@@ -489,7 +505,8 @@ class K8sState:
 
         # Pool decision:
         #   AMBIGUOUS → refuse to guess (workload unmanageable this tick).
-        #   None      → no GPU-product pin; use v0 default. Note that a
+        #   None      → no GPU-product pin in the affinity or the
+        #               nodeSelector; use the default. Note that a
         #               workload with *other* node affinity (disk, zone,
         #               hostname) but no GPU-product selector also lands
         #               here — that's correct: the default is about GPU
@@ -499,20 +516,26 @@ class K8sState:
         if pool is K8sState.AMBIGUOUS:
             return None
         if pool is None:
-            log.info("%s/%s: no GPU affinity; defaulting pool=%s",
-                     namespace, workload_name, DEFAULT_GPU_POOL)
-            pool = DEFAULT_GPU_POOL
+            selector = spec.get("nodeSelector") or spec.get("node_selector") or {}
+            if selector.get(GPU_PRODUCT_LABEL):
+                pool = _canonical_pool(selector[GPU_PRODUCT_LABEL])
+        defaulted = pool is None
+        if defaulted:
+            pool = self._default_pool()
+            log.info("%s/%s: no GPU pin; defaulting pool=%s",
+                     namespace, workload_name, pool)
         return Placement(
             namespace=namespace, name=workload_name, kind=kind,
             pool=pool, gpus_per_replica=total_gpus,
             workload_name=workload_name,
             spec_replicas=spec_replicas,
+            pool_defaulted=defaulted,
         )
 
     # Sentinel returned by _extract_pool_from_affinity when the workload
     # pins to ≥2 distinct GPU pools after canonicalization — genuinely
     # ambiguous, refuse to guess. Distinct from "no GPU-product pin",
-    # which falls through to DEFAULT_GPU_POOL.
+    # which falls through to _default_pool.
     AMBIGUOUS = object()
 
     @staticmethod
@@ -560,6 +583,11 @@ class K8sState:
             return canonical.pop()
         return K8sState.AMBIGUOUS
 
+    def _default_pool(self):
+        if DEFAULT_GPU_POOL:
+            return _canonical_pool(DEFAULT_GPU_POOL)
+        return self._largest_pool or FALLBACK_GPU_POOL
+
     # ---------- pool_capacity ----------
 
     def pool_capacity(self):
@@ -573,6 +601,13 @@ class K8sState:
         advertises gpu.count=8 in labels but only 7 allocatable after a
         DevicePlugin partial failure; the scheduler trusts allocatable,
         so we do too. Cordoned and NotReady nodes contribute zero.
+
+        Also refreshes the largest pool: of the pools with a schedulable
+        GPU, the one with the most GPUs on all its nodes, cordoned and
+        NotReady included, so an unpinned service's pool doesn't move
+        because a node went down for maintenance. A tie goes to the first
+        name, so it can't flip between ticks; a tick with no schedulable
+        GPU anywhere keeps the last answer.
         """
         core = self._core_api()
         t = time.monotonic()
@@ -580,14 +615,10 @@ class K8sState:
         log.info("k8s list_node: %.3fs, %d nodes", time.monotonic() - t, len(nodes))
 
         pools = {}
+        inventory = {}
         for n in nodes:
             labels = getattr(n.metadata, "labels", None) or {}
             if labels.get(GPU_PRESENT_LABEL) != "true":
-                continue
-            if getattr(n.spec, "unschedulable", False):
-                continue
-            conditions = getattr(n.status, "conditions", None) or []
-            if not any(c.type == "Ready" and c.status == "True" for c in conditions):
                 continue
             product = labels.get(GPU_PRODUCT_LABEL)
             if not product:
@@ -600,7 +631,17 @@ class K8sState:
             # TEMP-REVERT — fold aliased products (H800) into their
             # canonical pool so `pools` has a single entry for the
             # merged hardware class. To revoke: use `product` directly.
-            pools[_canonical_pool(product)] = pools.get(_canonical_pool(product), 0) + gpus
+            pool = _canonical_pool(product)
+            inventory[pool] = inventory.get(pool, 0) + gpus
+            if getattr(n.spec, "unschedulable", False):
+                continue
+            conditions = getattr(n.status, "conditions", None) or []
+            if not any(c.type == "Ready" and c.status == "True" for c in conditions):
+                continue
+            pools[pool] = pools.get(pool, 0) + gpus
+        usable = [p for p, gpus in pools.items() if gpus > 0]
+        if usable:
+            self._largest_pool = min(usable, key=lambda p: (-inventory[p], p))
         if not pools:
             log.warning("pool_capacity: no GPU nodes found")
         return pools

@@ -363,8 +363,8 @@ class ServiceView:
         if physical_pd is None:
             # Without per-role physical evidence the direction freeze
             # cannot run (I4); fall back to a hold rather than decide
-            # blind. Resolves itself once llm-openresty#26 exposes the
-            # role label.
+            # blind. Reached when the exporter is older than 0.2.13 or
+            # cannot list LeaderWorkerSets.
             return self._pd_transition(
                 readings, verdicts, placement, physical, None,
                 now, gates, proposal=None,
@@ -453,10 +453,8 @@ class ServiceView:
         """(prefill, decode) physical engine counts, or None.
 
         Returns None when *either* role series is missing — not a
-        per-role fallback. Until llm-openresty#26 exposes the role
-        label that never happens in production; synthesising a count
-        from committed would silently defeat the direction freeze
-        (I4)."""
+        per-role fallback. Synthesising a count from committed would
+        silently defeat the direction freeze (I4)."""
         def _role(role):
             r = readings.get(f"replicas_ready_{role}")
             if r is not None and r.state == "ok" and r.value is not None:
