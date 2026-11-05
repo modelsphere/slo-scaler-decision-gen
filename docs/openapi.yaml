@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: decision-gen
-  version: 0.8.0
+  version: 0.8.1
   summary: Replica decisions for LLM inference services, from their SLOs and live signals.
   description: |
     decision-gen decides how many replicas each service should run and serves
@@ -110,12 +110,13 @@ info:
     state the DS can't really be in, so it's loud (error-level log),
     keeps the row alive at (1,1) rather than vanishing.
 
-    A pdengine service stays **inert in production** until the
-    upstream bodylog exporter (llm-openresty#26) emits the
-    `role="prefill"|"decode"` label — the scheduler-side role-
-    level freeze can't see ramps/drains without it and the PD
-    branch holds at `hold-pd-no-role-physical`. Once that lands,
-    growth is booked against the pool's leftover after replica
+    A pdengine service scales only when bodylog-exporter 0.2.13 or
+    newer emits `bodylog_service_replicas_ready` with
+    `role="prefill"|"decode"`, which also needs `list` on
+    leaderworkersets. Without those series the role-level freeze
+    can't see ramps/drains, so the PD branch holds at
+    `hold-pd-no-role-physical` and the row stays at its committed
+    shape. Growth is booked against the pool's leftover after replica
     services have scheduled; pdengine services do not yet
     participate in cross-service priority preemption (follow-up).
 

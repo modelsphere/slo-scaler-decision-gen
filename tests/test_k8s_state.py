@@ -213,8 +213,8 @@ def test_multi_pool_template_unmanageable():
     assert state.resolve_placement("kimi", "x") is None
 
 
-def test_no_affinity_defaults_to_h100():
-    """V0 default: no GPU-product pin anywhere → DEFAULT_GPU_POOL.
+def test_no_affinity_defaults_to_h100_before_any_node_is_seen():
+    """No GPU-product pin, no pool_capacity() yet → FALLBACK_GPU_POOL.
     Covers pods like minimax-h3 that carry no affinity at all."""
     deploy = {"spec": {"template": {"spec": {
         "containers": [{"name": "m", "resources": {"limits": {"nvidia.com/gpu": 4}}}],
@@ -777,6 +777,151 @@ def test_pool_capacity_no_pods_call():
     state = K8sState(apps_v1=apps, core_v1=core, custom_v1=custom)
     state.pool_capacity()
     core.list_pod_for_all_namespaces.assert_not_called()
+
+
+# ---------- default pool: the cluster's largest ----------
+
+_UNPINNED = {"spec": {"template": {"spec": {
+    "containers": [{"name": "m", "resources": {"limits": {"nvidia.com/gpu": 4}}}],
+}}}}
+
+
+def _default_pool_for(nodes):
+    apps, core, custom = _fake_apis(deploy=_UNPINNED, nodes=nodes)
+    state = K8sState(apps_v1=apps, core_v1=core, custom_v1=custom)
+    state.pool_capacity()
+    return state.resolve_placement("ns", "svc").pool
+
+
+def test_no_affinity_defaults_to_largest_pool():
+    assert _default_pool_for([
+        _node("h1", POOL_H100, 8),
+        _node("a1", POOL_A100, 8),
+        _node("a2", POOL_A100, 8),
+    ]) == POOL_A100
+
+
+def test_largest_pool_counts_gpus_not_nodes():
+    assert _default_pool_for([
+        _node("h1", POOL_H100, 4),
+        _node("h2", POOL_H100, 4),
+        _node("a1", POOL_A100, 16),
+    ]) == POOL_A100
+
+
+def test_largest_pool_counts_cordoned_and_notready_nodes():
+    """Maintenance on the big pool must not re-home unpinned services."""
+    assert _default_pool_for([
+        _node("a1", POOL_A100, 8, cordoned=True),
+        _node("a2", POOL_A100, 8, ready=False),
+        _node("a3", POOL_A100, 8),
+        _node("h1", POOL_H100, 16),
+    ]) == POOL_A100
+
+
+def test_largest_pool_tie_goes_to_first_name():
+    assert _default_pool_for([
+        _node("a", "POOL-B", 8),
+        _node("b", "POOL-A", 8),
+    ]) == "POOL-A"
+
+
+def test_largest_pool_folds_aliases():
+    assert _default_pool_for([
+        _node("h1", POOL_H100, 8),
+        _node("h8", POOL_H800, 8),
+        _node("a1", POOL_A100, 8),
+    ]) == POOL_H100
+
+
+def test_largest_pool_skips_a_pool_with_no_schedulable_gpu():
+    """A pool being retired, all cordoned, has nothing to grow into."""
+    assert _default_pool_for([
+        _node("a1", POOL_A100, 8, cordoned=True),
+        _node("a2", POOL_A100, 8, cordoned=True),
+        _node("h1", POOL_H100, 8),
+    ]) == POOL_H100
+
+
+def test_largest_pool_survives_a_device_plugin_outage():
+    """Every node up but allocatable 0: no tie-break among empty pools."""
+    apps, core, custom = _fake_apis(deploy=_UNPINNED, nodes=[
+        _node("a1", "POOL-A", 8), _node("b1", "POOL-B", 16)])
+    state = K8sState(apps_v1=apps, core_v1=core, custom_v1=custom)
+    state.pool_capacity()
+    core.list_node.return_value.items = [
+        _node("a1", "POOL-A", 0), _node("b1", "POOL-B", 0)]
+    state.pool_capacity()
+    assert state.resolve_placement("ns", "svc").pool == "POOL-B"
+
+
+def test_node_selector_counts_as_a_pin():
+    deploy = {"spec": {"template": {"spec": {
+        "nodeSelector": {"nvidia.com/gpu.product": POOL_H800},
+        "containers": [{"name": "m", "resources": {"limits": {"nvidia.com/gpu": 4}}}],
+    }}}}
+    apps, core, custom = _fake_apis(deploy=deploy, nodes=[_node("a1", POOL_A100, 64)])
+    state = K8sState(apps_v1=apps, core_v1=core, custom_v1=custom)
+    state.pool_capacity()
+    assert state.resolve_placement("ns", "svc").pool == POOL_H100
+
+
+def test_lws_unpinned_leader_follows_pinned_worker():
+    """Must not depend on which pool is largest this tick."""
+    lws = {"spec": {
+        "replicas": 2,
+        "leaderWorkerTemplate": {
+            "size": 2,
+            "leaderTemplate": {"spec": {"containers": [
+                {"name": "m", "resources": {"limits": {"nvidia.com/gpu": 8}}}]}},
+            "workerTemplate": _pod_template(gpu_limit=8, pool=POOL_H100),
+        },
+    }}
+    apps, core, custom = _fake_apis(lws=lws, nodes=[_node("a1", POOL_A100, 64)])
+    state = K8sState(apps_v1=apps, core_v1=core, custom_v1=custom)
+    state.pool_capacity()
+    assert state.resolve_placement("ns", "svc").pool == POOL_H100
+
+
+def test_ds_unpinned_role_follows_pinned_role():
+    spec = {"slices": 1, "roles": [
+        {"name": "prefill", "spec": {"replicas": 1, "leaderWorkerTemplate": {
+            "size": 1,
+            "leaderTemplate": {"spec": {"containers": [
+                {"name": "m", "resources": {"limits": {"nvidia.com/gpu": 8}}}]}},
+            "workerTemplate": {"spec": {"containers": [
+                {"name": "m", "resources": {"limits": {"nvidia.com/gpu": 8}}}]}},
+        }}},
+        {"name": "decode", "spec": {"replicas": 1, "leaderWorkerTemplate": {
+            "size": 1,
+            "leaderTemplate": _pod_template(gpu_limit=8, pool=POOL_H100),
+            "workerTemplate": _pod_template(gpu_limit=8, pool=POOL_H100),
+        }}},
+    ]}
+    apps, core, custom = _fake_apis(ds={"spec": spec}, nodes=[_node("a1", POOL_A100, 64)])
+    state = K8sState(apps_v1=apps, core_v1=core, custom_v1=custom)
+    state.pool_capacity()
+    assert state.resolve_placement("ns", "svc").pool == POOL_H100
+
+
+def test_default_gpu_pool_env_is_canonicalized(monkeypatch):
+    monkeypatch.setattr(k8s_state, "DEFAULT_GPU_POOL", POOL_H800)
+    assert _default_pool_for([_node("a1", POOL_A100, 8)]) == POOL_H100
+
+
+def test_largest_pool_survives_a_tick_with_no_gpu_nodes():
+    apps, core, custom = _fake_apis(
+        deploy=_UNPINNED, nodes=[_node("a1", POOL_A100, 8)])
+    state = K8sState(apps_v1=apps, core_v1=core, custom_v1=custom)
+    state.pool_capacity()
+    core.list_node.return_value.items = []
+    state.pool_capacity()
+    assert state.resolve_placement("ns", "svc").pool == POOL_A100
+
+
+def test_default_gpu_pool_env_overrides_largest_pool(monkeypatch):
+    monkeypatch.setattr(k8s_state, "DEFAULT_GPU_POOL", POOL_A100)
+    assert _default_pool_for([_node("h1", POOL_H100, 8)]) == POOL_A100
 
 
 # ---------- TEMP-REVERT: H800-as-H100 pool merge ----------

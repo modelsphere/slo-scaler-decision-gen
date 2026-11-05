@@ -224,11 +224,16 @@ class Signals:
         and None here turns off IN_DRAIN detection in direction.phase_of).
         `max by(service)` then collapses pod/instance/route so HA or
         rolling restarts of the exporter can't produce >1 series. Values
-        are rounded after the collapse (C15)."""
+        are rounded after the collapse (C15).
+
+        `role=~"|router"` is the service-level view: "" for an ordinary
+        service (or an exporter older than the label), "router" for a PD
+        release. Unfiltered, a PD service reads max(router, prefill,
+        decode), which a replica-typed CR takes for a permanent drain."""
         svc = self._svc(namespace, service_id)
         r = self._query(
             f'max by(service)(avg_over_time('
-            f'bodylog_service_replicas_ready{{service="{svc}"}}[2m]))',
+            f'bodylog_service_replicas_ready{{service="{svc}", role=~"|router"}}[2m]))',
             label="replicas",
         )
         if r.state != "ok":
@@ -239,18 +244,16 @@ class Signals:
         """Physical ready engine count for one PD role.
 
         Same series as `replicas_ready`, filtered by the `role` label
-        the log-service added for pdengine workloads ("prefill" |
-        "decode"):
+        bodylog-exporter 0.2.13 added for PD releases ("prefill" |
+        "decode"; one ready LWS group is one engine):
 
             max by(service, role)(avg_over_time(
                 bodylog_service_replicas_ready{
                     service="...", role="..."}[2m]))
 
         Every non-ok state is returned untouched — the caller
-        (serviceview PD branch) treats a missing role series as "fall
-        back to the committed value", matching the spec-fallback
-        posture the rest of the serviceview uses when replicas_ready
-        goes quiet.
+        (serviceview PD branch) holds at the committed shape when
+        either role series is missing.
         """
         svc = self._svc(namespace, service_id)
         r = self._query(

@@ -32,6 +32,8 @@ The inputs are:
   as unbounded.
 - **Live signals from Prometheus** — the evidence that a threshold is being
   violated, or has been comfortably met long enough to scale back down.
+  PD scaling needs the per-role replica series from bodylog-exporter 0.2.13 or
+  newer; without them a `pdengine` service holds at its committed shape.
 - **Kubernetes state** — what is actually running, where it is placed, and how
   much pool capacity is left. Replica counts come from the workload rather than
   from anything this process remembers, so a hand-edited Deployment is seen, not
@@ -101,6 +103,7 @@ All by environment variable:
 | `TICK_SECONDS` | `60` | how often the whole picture is rebuilt |
 | `PROM_URL` | `http://kube-prometheus-stack-prometheus.monitoring:9090` | where the signals come from |
 | `PROM_TIMEOUT_S` | `5` | per-query timeout |
+| `DEFAULT_GPU_POOL` | unset | pool for a workload with no GPU-product pin; unset means the cluster's largest pool with a schedulable GPU, counting GPUs on all its nodes |
 | `LOG_LEVEL` | `INFO` | applies to this process only — the Kubernetes client dumps whole HTTP bodies at DEBUG and is capped at WARNING regardless |
 
 ## Building the image
