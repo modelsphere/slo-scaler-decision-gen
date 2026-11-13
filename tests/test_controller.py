@@ -401,7 +401,7 @@ def test_log_staleness_read_once_per_tick_and_fed_to_llm_services(
     fake_slo, fake_k8s, fake_signals, clock, cr_spec,
 ):
     """Issue #14: one global freshness reading per tick, held as an input
-    signal by every LLM service — they still step (comfort resets, the
+    signal by every LLM service — they still step (no comfort starts, the
     committed count stays on the wire) instead of being skipped."""
     _boot(fake_k8s, fake_signals)
     fake_k8s.placements[("ns", "svc2")] = Placement(
@@ -422,7 +422,7 @@ def test_log_staleness_read_once_per_tick_and_fed_to_llm_services(
     assert [c for c in fake_signals.calls if c[0] == "log_staleness"] == [("log_staleness",)]
     assert _decisions(ctl) == {"svc": 2, "svc2": 2}
     for key in (("ns", "svc"), ("ns", "svc2")):
-        assert ctl._views[key].comfortable_since is None
+        assert ctl._views[key].comfort_s is None
 
     # Pipeline back: the same 429 burst is real evidence and R1a fires.
     fake_signals.set_log_staleness(5.0)

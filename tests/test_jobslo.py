@@ -232,10 +232,10 @@ class TestJobView:
         readings = {"queue_depth": Reading(0, "ok")}
         # Tick 1: comfortable arrives
         t1 = self._tick(view, job_cr_spec, readings, physical=2, now=100)
-        assert view.comfortable_since == 100
+        assert view.comfort_s == 0
         # Tick 2: still comfortable → streak accumulates
         t2 = self._tick(view, job_cr_spec, readings, physical=2, now=200)
-        assert view.comfortable_since == 100
+        assert view.comfort_s == 100
 
     def test_grey_resets_comfort_and_blocks_shed(self, job_cr_spec):
         """GREY verdicts reset the comfort streak (same as LLM) AND block
@@ -248,7 +248,7 @@ class TestJobView:
             view, job_cr_spec, readings, physical=3,
             now=DOWN_COOLDOWN_S + COMFORT_SUSTAIN_S + 1000,
         )
-        assert view.comfortable_since is None
+        assert view.comfort_s is None
         assert t.proposal is None
         assert t.want == 3
 
@@ -295,11 +295,11 @@ class TestJobView:
         # Comfortable tick
         _ = self._tick(view, job_cr_spec, {"queue_depth": Reading(0, "ok")},
                        physical=3, now=100)
-        assert view.comfortable_since == 100
+        assert view.comfort_s == 0
         # Violated tick — comfort resets
         _ = self._tick(view, job_cr_spec, {"queue_depth": Reading(50, "ok")},
                        physical=3, now=200)
-        assert view.comfortable_since is None
+        assert view.comfort_s is None
 
     def test_cr_max_shrink_compresses_immediately(self, job_cr_spec):
         view = ServiceView("ns", "svc")

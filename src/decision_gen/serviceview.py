@@ -9,7 +9,9 @@ Owns, per (ns, service):
                         booking. pdengine services carry engines, not
                         bundles: `committed = pd.PdShape(p, d, ...)`.
   - last_change_at      epoch — single clock, two thresholds (D1)
-  - comfortable_since   epoch | None — unbroken comfort streak (R4)
+  - comfort_s           float | None — seconds of judged comfort in the
+                        current streak (R4); None = no streak
+  - last_judged_at      epoch | None — last tick that evaluated the streak
 
 Single mutation path: `commit()`. Every commit stamps the clock and
 zeroes comfort on delta — the R6 re-arm rule is un-skippable.
@@ -136,14 +138,16 @@ def _threshold(cr_spec, signal, kind):
 
 
 class ServiceView:
-    __slots__ = ("ns", "service", "committed", "last_change_at", "comfortable_since")
+    __slots__ = ("ns", "service", "committed", "last_change_at",
+                 "comfort_s", "last_judged_at")
 
     def __init__(self, ns, service):
         self.ns = ns
         self.service = service
         self.committed = None          # None = unseeded
         self.last_change_at = 0.0
-        self.comfortable_since = None
+        self.comfort_s = None
+        self.last_judged_at = None
 
     # ---------- sole mutation path ----------
 
@@ -158,7 +162,7 @@ class ServiceView:
                  _fmt_committed(replicas), cause)
         self.committed = replicas
         self.last_change_at = now
-        self.comfortable_since = None
+        self.comfort_s = None
         return True
 
     def reset_committed(self, cause):
@@ -171,7 +175,7 @@ class ServiceView:
         log.info("%s/%s: reset committed %s (%s)",
                  self.ns, self.service, _fmt_committed(self.committed), cause)
         self.committed = None
-        self.comfortable_since = None
+        self.comfort_s = None
 
     # ---------- CR bounds (R9) ----------
 
@@ -224,8 +228,7 @@ class ServiceView:
             physical=physical,
             gates=triggers.Gates(up_cooldown_open=False, shed_ready=False),
             since_change_s=int(now - self.last_change_at),
-            comfort_s=(None if self.comfortable_since is None
-                       else int(now - self.comfortable_since)),
+            comfort_s=_int_or_none(self.comfort_s),
             phase=direction.Phase.SETTLED,
             proposal=None,
             est=0, want=0,
@@ -348,8 +351,7 @@ class ServiceView:
                 gates=triggers.Gates(up_cooldown_open=False,
                                       shed_ready=False),
                 since_change_s=int(now - self.last_change_at),
-                comfort_s=(None if self.comfortable_since is None
-                           else int(now - self.comfortable_since)),
+                comfort_s=_int_or_none(self.comfort_s),
                 phase=direction.Phase.SETTLED,
                 proposal=None,
                 est=self.committed, want=self.committed,
@@ -366,18 +368,10 @@ class ServiceView:
 
         flat = [v for sig in verdicts.values() for v in sig.values()]
         any_missing = missing_slo or (rej is not None and rej.state != "ok")
-        all_comfy = (not any_missing
-                     and bool(flat)
-                     and all(v is Verdict.COMFORTABLE for v in flat))
-        if all_comfy:
-            if self.comfortable_since is None:
-                self.comfortable_since = now
-        else:
-            self.comfortable_since = None
+        self._advance_comfort(flat, any_missing, now)
 
         since_change = now - self.last_change_at
-        comfort_s = (None if self.comfortable_since is None
-                     else now - self.comfortable_since)
+        comfort_s = self.comfort_s
         gates = triggers.Gates(
             up_cooldown_open=since_change >= UP_COOLDOWN_S,
             shed_ready=(since_change >= DOWN_COOLDOWN_S
@@ -503,8 +497,7 @@ class ServiceView:
             physical=physical_pd,
             gates=gates,
             since_change_s=int(now - self.last_change_at),
-            comfort_s=(None if self.comfortable_since is None
-                       else int(now - self.comfortable_since)),
+            comfort_s=_int_or_none(self.comfort_s),
             phase=direction.Phase.SETTLED,   # PD uses reconcile_pd for phases
             proposal=proposal,
             est=est, want=want, hold_reason=hold_reason,
@@ -539,8 +532,7 @@ class ServiceView:
                 physical=physical,
                 gates=triggers.Gates(up_cooldown_open=False, shed_ready=False),
                 since_change_s=int(now - self.last_change_at),
-                comfort_s=(None if self.comfortable_since is None
-                           else int(now - self.comfortable_since)),
+                comfort_s=_int_or_none(self.comfort_s),
                 phase=direction.Phase.SETTLED,
                 proposal=None,
                 est=self.committed if self.committed is not None else 0,
@@ -579,8 +571,7 @@ class ServiceView:
                 physical=physical,
                 gates=triggers.Gates(up_cooldown_open=False, shed_ready=False),
                 since_change_s=int(now - self.last_change_at),
-                comfort_s=(None if self.comfortable_since is None
-                           else int(now - self.comfortable_since)),
+                comfort_s=_int_or_none(self.comfort_s),
                 phase=direction.Phase.SETTLED,
                 proposal=None,
                 est=self.committed if self.committed is not None else 0,
@@ -612,24 +603,18 @@ class ServiceView:
             rej_value = rej.value if rej is not None and rej.state == "ok" else None
 
         # ---- comfort streak (R4) ----
-        # Reset events: commit (inside commit()), any MISSING-series signal,
-        # any verdict leaving COMFORTABLE, any violation. `no_traffic` is
-        # NOT a reset — it feeds COMFORTABLE above, so an idle service's
+        # Reset events: commit (inside commit()), any verdict leaving
+        # COMFORTABLE, any violation. A MISSING-series signal pauses the
+        # streak instead (see `_advance_comfort`). `no_traffic` is NOT a
+        # reset — it feeds COMFORTABLE above, so an idle service's
         # comfort streak accumulates and it sheds after the down-cooldown.
         flat = [v for sig in verdicts.values() for v in sig.values()]
         any_missing = missing_slo or (rej is not None and rej.state != "ok")
-        all_comfy = (not any_missing
-                     and bool(flat)
-                     and all(v is Verdict.COMFORTABLE for v in flat))
-        if all_comfy:
-            if self.comfortable_since is None:
-                self.comfortable_since = now
-        else:
-            self.comfortable_since = None
+        self._advance_comfort(flat, any_missing, now)
 
         # ---- gates (D1: one clock, two thresholds) ----
         since_change = now - self.last_change_at
-        comfort_s = None if self.comfortable_since is None else now - self.comfortable_since
+        comfort_s = self.comfort_s
         gates = triggers.Gates(
             up_cooldown_open=since_change >= UP_COOLDOWN_S,
             shed_ready=(since_change >= DOWN_COOLDOWN_S
@@ -696,6 +681,25 @@ class ServiceView:
         )
 
     # ---------- internals ----------
+
+    def _advance_comfort(self, flat, any_missing, now):
+        """One tick of the R4 comfort streak: reset, run, or pause.
+
+        A VIOLATED or GREY verdict is evidence against comfort and resets
+        the streak, even if another signal is missing. All COMFORTABLE
+        runs it: the time since the last judged tick is added. A missing
+        signal (a missing series, a stale request log) with no evidence
+        against comfort pauses it — no evidence, no judgement — so that
+        gap is never counted and the comfort before it is kept.
+        """
+        discomfort = any(v is not None and v is not Verdict.COMFORTABLE
+                         for v in flat)
+        if discomfort or not flat:
+            self.comfort_s = None
+        elif not any_missing:
+            self.comfort_s = (0.0 if self.comfort_s is None
+                              else self.comfort_s + now - self.last_judged_at)
+        self.last_judged_at = now
 
     @staticmethod
     def _llm_verdicts(readings, cr_spec):
@@ -769,7 +773,7 @@ class ServiceView:
                     gates, phase, proposal, est, want, hold_reason,
                     pd_shape=None):
         since_change = now - self.last_change_at
-        comfort_s = None if self.comfortable_since is None else now - self.comfortable_since
+        comfort_s = self.comfort_s
         return Transition(
             ns=self.ns, service=self.service,
             pool=placement.pool, gpr=placement.gpus_per_replica,
@@ -778,7 +782,7 @@ class ServiceView:
             physical=physical,
             gates=gates,
             since_change_s=int(since_change),
-            comfort_s=None if comfort_s is None else int(comfort_s),
+            comfort_s=_int_or_none(comfort_s),
             phase=phase, proposal=proposal,
             est=est, want=want, hold_reason=hold_reason,
             skip=False,
@@ -805,6 +809,10 @@ def within_bounds(committed, cr_spec, pd_spec=None):
         lo, hi = pd.per_slice_window(mn, mx, pd_spec.slices)
         return lo is not None and lo <= committed.engines <= hi
     return not is_pd and mn <= committed <= mx
+
+
+def _int_or_none(x):
+    return None if x is None else int(x)
 
 
 def _fmt_committed(n):

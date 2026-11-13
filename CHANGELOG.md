@@ -9,6 +9,11 @@ no `v` prefix; each tag publishes the image
 ## [Unreleased]
 
 ### Fixed
+- A tick with a missing signal (a missing series, or a stale request log)
+  pauses the scale-down comfort streak instead of restarting it: the gap is
+  not counted as comfort, and the comfort before it is kept. A violated or
+  grey verdict still restarts it. Before, a cluster that went quiet for more
+  than `LOG_STALE_S` at least once every `SCALE_DOWN_COMFORT_S` never shed.
 - The SLO CR's `[min, max]` is respected on every row `/decisions` serves.
   A tick that skipped a service served its last count whatever the CR now
   said: a service resumed from `min = max = 0` stayed at 0 while its
