@@ -345,6 +345,67 @@ def test_max_shrink_works_with_missing_signal():
     assert v.committed == 2
 
 
+# ---------- CR bounds hold on skipped ticks (R9) ----------
+
+def _bounded(mn, mx):
+    cr = dict(CR)
+    cr["minimumDeployment"] = {"type": "replica", "value": mn}
+    cr["maximumDeployment"] = {"type": "replica", "value": mx}
+    return cr
+
+
+def test_max_shrink_applies_when_physical_missing():
+    """Suspend (min=max=0) while replicas_ready is absent: the skip
+    must not serve the pre-suspend count."""
+    v = ServiceView("ns", "svc")
+    v.step(comfy_readings(), PLACEMENT, CR, 3, now=0.0)
+    for physical in (None, 0):
+        v.step(comfy_readings(), PLACEMENT, _bounded(0, 0), physical, now=60.0)
+        assert v.committed == 0
+
+
+def test_min_raise_applies_when_physical_zero():
+    """Resume from suspend: the workload sits at zero ready replicas,
+    so every tick skips — the raised min must still land."""
+    v = ServiceView("ns", "svc")
+    v.step(comfy_readings(), PLACEMENT, CR, 3, now=0.0)
+    v.step(comfy_readings(), PLACEMENT, _bounded(0, 0), 3, now=60.0)
+    assert v.committed == 0
+    t = v.step(comfy_readings(), PLACEMENT, _bounded(1, 8), 0, now=120.0)
+    assert t.skip is True
+    assert v.committed == 1
+
+
+def test_enforce_bounds_clamps_both_ways():
+    v = ServiceView("ns", "svc")
+    v.committed = 5
+    v.enforce_bounds(_bounded(1, 3), now=0.0)
+    assert v.committed == 3
+    v.enforce_bounds(_bounded(4, 8), now=60.0)
+    assert v.committed == 4
+    assert v.last_change_at == 60.0
+
+
+def test_within_bounds():
+    from decision_gen import pd
+    from decision_gen.k8s_state import PDSpec
+    from decision_gen.serviceview import within_bounds
+    assert within_bounds(3, _bounded(1, 8))
+    assert not within_bounds(0, _bounded(1, 8))
+    assert not within_bounds(9, _bounded(1, 8))
+    assert not within_bounds(3, {"minimumDeployment": {"value": 1}})
+    pd_cr = {"minimumDeployment": {"type": "pdengine", "value": 6},
+             "maximumDeployment": {"type": "pdengine", "value": 8}}
+    spec = PDSpec(slices=1, prefill=4, decode=2,
+                  role_group_gpus={"prefill": 8, "decode": 8})
+    assert within_bounds(pd.PdShape(4, 2, 6), pd_cr, spec)
+    assert not within_bounds(pd.PdShape(1, 1, 2), pd_cr, spec)
+    assert not within_bounds(pd.PdShape(4, 2, 6), pd_cr, None)
+    # Currency mismatch is never in bounds.
+    assert not within_bounds(6, pd_cr, spec)
+    assert not within_bounds(pd.PdShape(1, 1, 2), _bounded(1, 8))
+
+
 # ---------- end-to-end one-tick stages ----------
 
 def test_r1a_fires_immediately_after_boot_with_rejection():

@@ -313,6 +313,44 @@ def test_pd_step_bounds_too_tight_compresses_to_1p1d():
     assert t.pd_shape == pd.PdShape(1, 1, 2)
 
 
+def test_pd_step_inexpressible_below_min_omits_not_1p1d():
+    """Live 0p0d (resumed from a suspend), CR window [6,8]: the 1p1d
+    fallback would sit below min. Omit the row instead."""
+    cr = _pd_cr()
+    cr["maximumDeployment"] = {"type": "pdengine", "value": 8}
+    zero = Placement(
+        namespace="ns", name="svc", kind="disaggregatedset",
+        pool="p", gpus_per_replica=0, workload_name="svc",
+        spec_replicas=1, members=(("lws", "svc-prefill"), ("lws", "svc-decode")),
+        pd=PDSpec(slices=1, prefill=0, decode=0,
+                  role_group_gpus={"prefill": 8, "decode": 8}),
+    )
+    readings = _pd_readings()
+    readings["replicas_ready_prefill"] = Reading(0, "ok")
+    readings["replicas_ready_decode"] = Reading(0, "ok")
+    v = sv.ServiceView("ns", "svc")
+    v.committed = pd.PdShape(0, 0, 0)
+    t = v.step(readings, zero, cr, 1, now=0.0)
+    assert t.skip is True
+    assert t.pd_shape is None
+    assert "hold-pdengine-bounds" in t.hold_reason
+
+
+def test_pd_step_bounds_fix_applies_when_physical_missing():
+    """The no-physical hold must serve a shape inside the CR window,
+    not the pre-change committed."""
+    v = sv.ServiceView("ns", "svc")
+    v.step(_pd_readings(), PD_PLACEMENT, _pd_cr(), 3, now=0.0)
+    assert v.committed.engines >= 6
+    tighter = _pd_cr()
+    tighter["minimumDeployment"] = {"type": "pdengine", "value": 2}
+    tighter["maximumDeployment"] = {"type": "pdengine", "value": 4}
+    t = v.step(_pd_readings(), PD_PLACEMENT, tighter, None, now=60.0)
+    assert t.skip is True
+    assert 2 <= v.committed.engines <= 4
+    assert t.pd_shape == v.committed
+
+
 def test_pd_step_non_ds_refuses():
     v = sv.ServiceView("ns", "svc")
     placement = Placement(
@@ -405,6 +443,33 @@ def test_controller_pd_goes_through_planner_and_wire_shape_block(
     assert pd_block["decode"]["liveReplicas"] == 1
 
 
+def test_controller_omits_pd_row_outside_bounds_when_unresolvable(
+        fake_slo, fake_k8s, fake_signals, clock, pd_cr_spec):
+    """R9 backstop: the DS can't be read, so nothing can walk the shape
+    into a new window — the row is omitted, not served out of bounds."""
+    fake_slo.set("ns", "svc", pd_cr_spec)
+    fake_k8s.placements[("ns", "svc")] = PD_PLACEMENT
+    fake_k8s.capacity = {"p": 64}
+    fake_signals.set_replicas_ready(3)
+    fake_signals.set_replicas_ready_role("prefill", 2)
+    fake_signals.set_replicas_ready_role("decode", 1)
+    fake_signals.set_ttft("ns", "svc", "p80", 5.0)
+    fake_signals.set_otps("ns", "svc", "p80", 100.0)
+    fake_signals.set_rejection(0.0)
+    ctl = Controller(slo=fake_slo, k8s=fake_k8s, signals=fake_signals,
+                     tick_seconds=60, clock=clock)
+    ctl.tick()
+    assert [d["serviceId"] for d in ctl.snapshot()["decisions"]] == ["svc"]
+
+    fake_k8s.placements[("ns", "svc")] = None
+    raised = dict(pd_cr_spec)
+    raised["minimumDeployment"] = {"type": "pdengine", "value": 10}
+    fake_slo.set("ns", "svc", raised)
+    clock.advance(60)
+    ctl.tick()
+    assert ctl.snapshot()["decisions"] == []
+
+
 def test_controller_pd_non_pd_rows_unchanged(fake_slo, fake_k8s,
                                              fake_signals, clock):
     """Regression: a replica-typed service still renders v1 wire and
@@ -481,7 +546,8 @@ def test_cr_type_flip_pdengine_to_replica_reseeds():
 def test_pd_step_seeds_from_ds_spec_when_physical_missing():
     """A pdengine service whose replicas_ready never comes up must
     still appear on the wire at its seeded shape (spec), matching the
-    replica path's boot posture."""
+    replica path's boot posture — walked into the CR window first: the
+    live 2p1d is below min=6, so the served shape is 4p2d (R9)."""
     empty = {
         "rejection": Reading(None, "missing_series"),
         "replicas_ready_prefill": Reading(None, "missing_series"),
@@ -489,8 +555,8 @@ def test_pd_step_seeds_from_ds_spec_when_physical_missing():
     }
     v = sv.ServiceView("ns", "svc")
     t = v.step(empty, PD_PLACEMENT, _pd_cr(), None, now=0.0)
-    assert v.committed == pd.PdShape(2, 1, 3)
-    assert t.pd_shape == pd.PdShape(2, 1, 3)
+    assert v.committed == pd.PdShape(4, 2, 6)
+    assert t.pd_shape == pd.PdShape(4, 2, 6)
 
 
 def test_pd_step_holds_when_role_physical_missing():
