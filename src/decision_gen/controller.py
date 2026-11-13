@@ -404,8 +404,8 @@ class Controller:
             # this is where a missed one becomes visible.
             if not within_bounds(v.committed, specs.get(key),
                                  self._pd_specs.get(key)):
-                log.error("%s/%s: committed %s outside CR bounds; "
-                          "omitting from /decisions",
+                log.error("%s/%s: committed %s not within the CR's "
+                          "bounds (or CR has none); omitting from /decisions",
                           key[0], key[1], _fmt_committed(v.committed))
                 continue
             committed[key] = v.committed
