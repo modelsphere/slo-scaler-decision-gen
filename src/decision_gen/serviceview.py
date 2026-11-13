@@ -42,6 +42,7 @@ UP_COOLDOWN_S     = _env_int("SCALE_UP_COOLDOWN_S",     900)   # 15 min
 DOWN_COOLDOWN_S   = _env_int("SCALE_DOWN_COOLDOWN_S",  1800)   # 30 min
 COMFORT_SUSTAIN_S = _env_int("SCALE_DOWN_COMFORT_S",   1200)   # 20 min
 SLO_HEADROOM      = _env_float("SLO_HEADROOM",          0.5)
+LOG_STALE_S       = _env_int("LOG_STALE_S",              90)   # request-log freshness gate
 
 
 Transition = namedtuple("Transition", [
@@ -705,6 +706,16 @@ class ServiceView:
         """
         verdicts = {"ttft": {}, "otps": {}}
         missing_slo = []
+        # A dead log pipeline reads exactly like an idle service: the
+        # quantiles go NaN (`no_traffic` → comfort → shed) and the
+        # rejection rate's denominator flattens to its clamp (R1a fires).
+        # Stale or unreadable log → every SLO signal is no evidence.
+        log_r = readings.get("log")
+        if log_r is not None:
+            if log_r.state != "ok":
+                missing_slo.append(f"log:{log_r.state}")
+            elif log_r.value > LOG_STALE_S:
+                missing_slo.append(f"log:stale={int(log_r.value)}s")
         for signal in ("ttft", "otps"):
             for kind, r in (readings.get(signal) or {}).items():
                 if r.state == "ok":

@@ -204,6 +204,10 @@ class Controller:
                            # candidates; the placement supplies pool +
                            # role_group_gpus for the leftover math
 
+        # Request-log freshness: one global reading, fed to every LLM
+        # service as an input signal (job services don't read the log).
+        log_stale = self.signals.log_staleness() if crs else None
+
         for (ns, svc), spec, cr_kind in merged:
             key = (ns, svc)
             log.info("─── %s/%s (%s) %s", ns, svc, cr_kind,
@@ -249,6 +253,7 @@ class Controller:
                     "rejection": self.signals.rejection_rate(ns, svc),
                     "rejection_count": self.signals.rejection_count_2m(ns, svc),
                     "request_count": self.signals.request_count_5m(ns, svc),
+                    "log": log_stale,
                 }
                 if _bounds_kind(spec) == "pdengine":
                     for role in ("prefill", "decode"):

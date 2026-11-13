@@ -57,6 +57,7 @@ class FakeSignals:
         self.replicas_ready_role_val = {}  # {role: value | Reading}
         self.queue_depth_overrides = {}    # {(ns, svc): value | Reading}
         self.queue_depth_default = None    # fallback when no override
+        self.log_staleness_val = 0.0       # fresh: tests opt in to staleness
         self.calls = []
 
     def _wrap(self, v):
@@ -89,6 +90,13 @@ class FakeSignals:
 
     def set_request_count(self, value):
         self.request_count_val = value
+
+    def log_staleness(self):
+        self.calls.append(("log_staleness",))
+        return self._wrap(self.log_staleness_val)
+
+    def set_log_staleness(self, value):
+        self.log_staleness_val = value
 
     def replicas_ready(self, ns, svc):
         self.calls.append(("replicas_ready", ns, svc))

@@ -9,7 +9,7 @@ comfort.
 
 from decision_gen.k8s_state import Placement
 from decision_gen.serviceview import (
-    COMFORT_SUSTAIN_S, DOWN_COOLDOWN_S, UP_COOLDOWN_S,
+    COMFORT_SUSTAIN_S, DOWN_COOLDOWN_S, LOG_STALE_S, UP_COOLDOWN_S,
     ServiceView,
 )
 from decision_gen.signals import Reading
@@ -500,3 +500,76 @@ def test_i4_shed_stays_shed_through_drain():
     assert t_spike.est > 34                     # passed the clamp (max=100)
     assert t_spike.want == 34                   # freeze-in-drain snapped it
     assert t_spike.hold_reason.startswith("freeze-in-drain")
+
+
+# ---------- request-log freshness gate (issue #14) ----------
+#
+# A dead log pipeline makes every bodylog-derived signal go flat, which
+# reads exactly like an idle service, while the proxy-polled 429 counter
+# keeps counting. The global staleness reading is an input signal: stale
+# or missing → no evidence → hold, comfort reset.
+
+def _with_log(readings, log):
+    readings = dict(readings)
+    readings["log"] = log
+    return readings
+
+
+def _idle():
+    r = comfy_readings()
+    r["ttft"]["p80"] = notraffic()
+    r["otps"]["p80"] = notraffic()
+    r["rejection"] = ok(0.0)
+    r["request_count"] = ok(0.0)
+    return r
+
+
+def test_stale_log_holds_and_resets_comfort():
+    v = ServiceView("ns", "svc")
+    v.step(_with_log(comfy_readings(), ok(5.0)), PLACEMENT, CR, 3, now=0.0)
+    assert v.comfortable_since == 0.0
+    t = v.step(_with_log(_idle(), ok(120.0)), PLACEMENT, CR, 3, now=60.0)
+    assert t.hold_reason == "hold-missing-signal log:stale=120s"
+    assert v.comfortable_since is None
+
+
+def test_log_staleness_at_the_limit_is_fresh():
+    v = ServiceView("ns", "svc")
+    t = v.step(_with_log(comfy_readings(), ok(float(LOG_STALE_S))),
+               PLACEMENT, CR, 3, now=0.0)
+    assert "log:" not in t.hold_reason
+    assert v.comfortable_since == 0.0
+
+
+def test_missing_log_reading_holds():
+    v = ServiceView("ns", "svc")
+    t = v.step(_with_log(comfy_readings(), miss()), PLACEMENT, CR, 3, now=0.0)
+    assert t.hold_reason == "hold-missing-signal log:missing_series"
+
+
+def test_stale_log_never_sheds_an_idle_service():
+    """The issue's first half: the quantiles go no_traffic once the 5m
+    window empties, and without the gate comfort accrues and sheds."""
+    v = ServiceView("ns", "svc")
+    v.step(_with_log(comfy_readings(), ok(5.0)), PLACEMENT, CR, 3, now=0.0)
+    for minute in range(1, 69):
+        t = v.step(_with_log(_idle(), ok(60.0 * minute)),
+                   PLACEMENT, CR, 3, now=60.0 * minute)
+        assert t.want == 3, (minute, t.hold_reason)
+    # Pipeline back: the comfort clock starts from zero, not from t=0.
+    t = v.step(_with_log(_idle(), ok(5.0)), PLACEMENT, CR, 3, now=60.0 * 69)
+    assert t.want == 3
+    assert t.comfort_s == 0
+
+
+def test_stale_log_blocks_the_clamped_rejection_fire_alarm():
+    """The issue's second half: the request-rate denominator is clamped
+    to 0.001, so 429s alone read as rej≈9000 and R1a fires."""
+    burst = _idle()
+    burst["rejection"] = ok(8970.0)
+    burst["rejection_count"] = ok(1000.0)
+    v = ServiceView("ns", "svc")
+    v.step(_with_log(comfy_readings(), ok(5.0)), PLACEMENT, CR, 3, now=0.0)
+    t = v.step(_with_log(burst, ok(3600.0)), PLACEMENT, CR, 3, now=60.0)
+    assert t.proposal is None
+    assert t.want == 3
