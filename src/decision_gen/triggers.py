@@ -4,7 +4,7 @@ Pure. No state, no clock, no env — every input arrives as an argument;
 every decision is a function of them. What this module does NOT know
 (by contract, arch §3.2):
 
-  - No `last_change_at`, `comfortable_since`, `now`. Cooldown and
+  - No `last_change_at`, `comfort_s`, `now`. Cooldown and
     comfort arrive as `Gates` booleans; clock count is invisible here.
   - No clamping. `[min, max]` is CR authority (R9), applied by
     serviceview at the est stage. Proposals may exceed max.

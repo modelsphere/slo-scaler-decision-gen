@@ -107,7 +107,7 @@ def test_boot_stamps_clock_and_zeroes_comfort():
     v.step(comfy_readings(), PLACEMENT, CR, physical=3, now=100.0)
     assert v.last_change_at == 100.0
     # This very tick starts the comfort streak — nothing sheds on boot.
-    assert v.comfortable_since == 100.0
+    assert v.comfort_s == 0.0
 
 
 # ---------- comfort streak (R4) ----------
@@ -115,46 +115,70 @@ def test_boot_stamps_clock_and_zeroes_comfort():
 def test_comfort_streak_accumulates():
     v = ServiceView("ns", "svc")
     v.step(comfy_readings(), PLACEMENT, CR, 3, now=0.0)
-    assert v.comfortable_since == 0.0
+    assert v.comfort_s == 0.0
     v.step(comfy_readings(), PLACEMENT, CR, 3, now=60.0)
-    assert v.comfortable_since == 0.0        # still anchored at start
+    assert v.comfort_s == 60.0
     assert v.step(comfy_readings(), PLACEMENT, CR, 3, now=120.0).comfort_s == 120
 
 
 def test_comfort_resets_on_violation():
     v = ServiceView("ns", "svc")
     v.step(comfy_readings(), PLACEMENT, CR, 3, now=0.0)
-    assert v.comfortable_since is not None
+    assert v.comfort_s is not None
     v.step(violated_readings(), PLACEMENT, CR, 3, now=60.0)
-    assert v.comfortable_since is None
+    assert v.comfort_s is None
 
 
-def test_comfort_resets_on_missing_signal():
+def test_comfort_pauses_on_missing_signal():
+    """No evidence, no judgement: the missing tick's gap is not counted,
+    the comfort before it is kept."""
     v = ServiceView("ns", "svc")
     v.step(comfy_readings(), PLACEMENT, CR, 3, now=0.0)
+    v.step(comfy_readings(), PLACEMENT, CR, 3, now=60.0)
+    bad = comfy_readings()
+    bad["ttft"]["p80"] = miss()
+    t = v.step(bad, PLACEMENT, CR, 3, now=120.0)
+    assert t.comfort_s == 60                 # frozen, not reset
+    t = v.step(comfy_readings(), PLACEMENT, CR, 3, now=180.0)
+    assert t.comfort_s == 120                # 0→60 and 120→180
+
+
+def test_comfort_resets_on_violation_beside_missing_signal():
+    """A missing signal does not shield real discomfort elsewhere."""
+    v = ServiceView("ns", "svc")
+    v.step(comfy_readings(), PLACEMENT, CR, 3, now=0.0)
+    bad = violated_readings()
+    bad["otps"]["p80"] = miss()
+    v.step(bad, PLACEMENT, CR, 3, now=60.0)
+    assert v.comfort_s is None
+
+
+def test_missing_signal_does_not_start_a_streak():
+    v = ServiceView("ns", "svc")
+    v.step(violated_readings(), PLACEMENT, CR, 3, now=0.0)
     bad = comfy_readings()
     bad["ttft"]["p80"] = miss()
     v.step(bad, PLACEMENT, CR, 3, now=60.0)
-    assert v.comfortable_since is None
+    assert v.comfort_s is None
 
 
 def test_no_traffic_counts_as_comfort_for_shed():
     """R1c: `no_traffic` verdicts are COMFORTABLE (zero demand = deepest
     comfort); comfort streak does NOT reset; shed proceeds once the
-    down-cooldown and sustainment both pass. `missing_series` continues
-    to reset and hold (test_comfort_resets_on_missing_signal above)."""
+    down-cooldown and sustainment both pass. `missing_series` holds and
+    pauses the streak (test_comfort_pauses_on_missing_signal above)."""
     v = ServiceView("ns", "svc")
     # Seed at t=0 with normal comfy readings.
     v.step(comfy_readings(), PLACEMENT, CR, 3, now=0.0)
-    assert v.comfortable_since == 0.0
+    assert v.comfort_s == 0.0
 
     # Service goes idle — NaN on both SLO channels.
     idle = comfy_readings()
     idle["ttft"]["p80"] = notraffic()
     idle["otps"]["p80"] = notraffic()
     t = v.step(idle, PLACEMENT, CR, 3, now=60.0)
-    # Comfort streak must NOT have reset at t=60 — it's still anchored at 0.
-    assert v.comfortable_since == 0.0
+    # Comfort streak must NOT have reset at t=60 — it kept running.
+    assert v.comfort_s == 60.0
     # Verdicts should be COMFORTABLE (not part of missing_slo), so no
     # missing-signal hold fired.
     assert not t.hold_reason.startswith("hold-missing-signal"), t.hold_reason
@@ -169,7 +193,7 @@ def test_no_traffic_sheds_after_cooldowns():
     idle = comfy_readings()
     idle["ttft"]["p80"] = notraffic()
     idle["otps"]["p80"] = notraffic()
-    # Wait past both cooldowns; comfort anchor is still 0.
+    # Wait past both cooldowns; the streak runs the whole way.
     t = v.step(idle, PLACEMENT, CR, 3, now=float(DOWN_COOLDOWN_S + COMFORT_SUSTAIN_S + 60))
     assert t.proposal is not None and t.proposal.rule == "r1c-shed", t.hold_reason
 
@@ -177,9 +201,9 @@ def test_no_traffic_sheds_after_cooldowns():
 def test_comfort_resets_on_commit():
     v = ServiceView("ns", "svc")
     v.step(comfy_readings(), PLACEMENT, CR, 3, now=0.0)
-    assert v.comfortable_since is not None
+    assert v.comfort_s is not None
     v.commit(4, now=120.0, cause="planner")
-    assert v.comfortable_since is None
+    assert v.comfort_s is None
 
 
 # ---------- commit semantics ----------
@@ -233,7 +257,7 @@ def test_skip_on_physical_none():
     assert "no-physical-data" in t.hold_reason
     # No clock stamp, no comfort reset, since_change hasn't moved from 0 base.
     assert v.last_change_at == 0.0
-    assert v.comfortable_since == 0.0      # preserved, not reset
+    assert v.comfort_s == 0.0              # preserved, not reset
 
 
 def test_skip_on_physical_zero():
@@ -250,7 +274,7 @@ def test_skip_on_physical_zero():
     assert t.proposal is None
     assert v.committed == 3
     assert v.last_change_at == 0.0         # not stamped at t=120
-    assert v.comfortable_since == 0.0      # anchor preserved from t=0
+    assert v.comfort_s == 0.0              # preserved from t=0
 
 
 def test_skip_still_seeds_new_service():
@@ -271,10 +295,10 @@ def test_skip_does_not_reset_comfort_streak():
     v = ServiceView("ns", "svc")
     v.step(comfy_readings(), PLACEMENT, CR, physical=3, now=0.0)
     v.step(comfy_readings(), PLACEMENT, CR, physical=3, now=60.0)
-    assert v.comfortable_since == 0.0
+    assert v.comfort_s == 60.0
     # Dead-air tick mid-streak.
     v.step(comfy_readings(), PLACEMENT, CR, physical=0, now=120.0)
-    assert v.comfortable_since == 0.0      # unchanged, NOT None
+    assert v.comfort_s == 60.0             # unchanged, NOT None
     # Next real tick: streak is 180s, not 60s.
     t = v.step(comfy_readings(), PLACEMENT, CR, physical=3, now=180.0)
     assert t.skip is False
@@ -507,7 +531,7 @@ def test_i4_shed_stays_shed_through_drain():
 # A dead log pipeline makes every bodylog-derived signal go flat, which
 # reads exactly like an idle service, while the proxy-polled 429 counter
 # keeps counting. The global staleness reading is an input signal: stale
-# or missing → no evidence → hold, comfort reset.
+# or missing → no evidence → hold, comfort paused.
 
 def _with_log(readings, log):
     readings = dict(readings)
@@ -524,13 +548,31 @@ def _idle():
     return r
 
 
-def test_stale_log_holds_and_resets_comfort():
+def test_stale_log_holds_and_pauses_comfort():
     v = ServiceView("ns", "svc")
     v.step(_with_log(comfy_readings(), ok(5.0)), PLACEMENT, CR, 3, now=0.0)
-    assert v.comfortable_since == 0.0
-    t = v.step(_with_log(_idle(), ok(120.0)), PLACEMENT, CR, 3, now=60.0)
+    v.step(_with_log(comfy_readings(), ok(5.0)), PLACEMENT, CR, 3, now=60.0)
+    t = v.step(_with_log(_idle(), ok(120.0)), PLACEMENT, CR, 3, now=120.0)
     assert t.hold_reason == "hold-missing-signal log:stale=120s"
-    assert v.comfortable_since is None
+    assert t.comfort_s == 60
+
+
+def test_quiet_gap_does_not_restart_comfort():
+    """10 min comfortable, a 2 min cluster-wide gap, 10 min comfortable:
+    20 min of judged comfort, so the streak meets COMFORT_SUSTAIN_S."""
+    v = ServiceView("ns", "svc")
+    now = 0.0
+    for _ in range(11):                      # t=0..600: 600s of comfort
+        t = v.step(_with_log(comfy_readings(), ok(5.0)), PLACEMENT, CR, 3, now=now)
+        now += 60.0
+    for _ in range(2):                       # t=660, 720: stale, paused
+        t = v.step(_with_log(_idle(), ok(LOG_STALE_S + 30.0)), PLACEMENT, CR, 3, now=now)
+        assert t.comfort_s == 600
+        now += 60.0
+    for _ in range(10):                      # t=780..1320: 600s more
+        t = v.step(_with_log(comfy_readings(), ok(5.0)), PLACEMENT, CR, 3, now=now)
+        now += 60.0
+    assert t.comfort_s == COMFORT_SUSTAIN_S
 
 
 def test_log_staleness_at_the_limit_is_fresh():
@@ -538,7 +580,7 @@ def test_log_staleness_at_the_limit_is_fresh():
     t = v.step(_with_log(comfy_readings(), ok(float(LOG_STALE_S))),
                PLACEMENT, CR, 3, now=0.0)
     assert "log:" not in t.hold_reason
-    assert v.comfortable_since == 0.0
+    assert v.comfort_s == 0.0
 
 
 def test_missing_log_reading_holds():
@@ -556,10 +598,12 @@ def test_stale_log_never_sheds_an_idle_service():
         t = v.step(_with_log(_idle(), ok(60.0 * minute)),
                    PLACEMENT, CR, 3, now=60.0 * minute)
         assert t.want == 3, (minute, t.hold_reason)
-    # Pipeline back: the comfort clock starts from zero, not from t=0.
+    # Pipeline back: the 68 stale minutes are not comfort. Only t=0→60
+    # (the minute-1 reading was still under LOG_STALE_S) and the first
+    # fresh minute count.
     t = v.step(_with_log(_idle(), ok(5.0)), PLACEMENT, CR, 3, now=60.0 * 69)
     assert t.want == 3
-    assert t.comfort_s == 0
+    assert t.comfort_s == 120
 
 
 def test_stale_log_blocks_the_clamped_rejection_fire_alarm():
