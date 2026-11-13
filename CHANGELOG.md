@@ -17,6 +17,15 @@ no `v` prefix; each tag publishes the image
   read, or the tick failed. Bounds are now applied to every live service
   at the start of each tick, a failed tick republishes those values, and
   a row still outside its bounds is omitted with an error log.
+- A dead request-log pipeline no longer reads as an idle service. With the
+  log listener down and its exporter up, every bodylog series went flat:
+  quiet services shed to their minimum (TTFT/OTPS read `no_traffic`, which
+  counts as comfort) and any 429s drove R1a to the maximum (the request
+  rate behind the rejection ratio clamped to 0.001, so rej read ~9000).
+  Each tick now reads `time() - max(bodylog_exporter_last_ts_seconds)` once
+  and every LLM service holds while it exceeds `LOG_STALE_S` (default 90s)
+  or is missing, logging `hold-missing-signal log:stale=<N>s` and
+  restarting its comfort streak. Job services are unaffected (#14).
 - A pdengine service whose shape cannot be walked into its CR window is
   no longer compressed to 1p1d when that is below the window's min; it is
   omitted. The bounds fix also applies on ticks with no physical data.

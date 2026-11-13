@@ -179,6 +179,24 @@ class Signals:
             label="req.count",
         )
 
+    def log_staleness(self):
+        """Seconds since the exporter last observed a request-log line.
+
+        Global, not per service: the gauge is unlabeled, and the
+        listener → exporter pipeline is shared, so it fails as a unit.
+        When the pipeline is down every bodylog_* series goes flat and
+        reads exactly like an idle service (`no_traffic`), while the
+        proxy-polled `openresty_rejected_total` keeps counting. Callers
+        hold every LLM service while this is stale (issue #14).
+
+        An exporter that has not read a line since it started reports
+        0, which reads as stale — the safe direction.
+        """
+        return self._query(
+            "time() - max(bodylog_exporter_last_ts_seconds)",
+            label="log.stale",
+        )
+
     def job_replicas_ready(self, namespace, deployment_name):
         """Physical ready replicas for job workloads, via kube-state-metrics.
 
