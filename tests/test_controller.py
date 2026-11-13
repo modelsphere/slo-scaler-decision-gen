@@ -99,6 +99,72 @@ def test_pool_capacity_failure_holds_previous_snapshot(
     assert _decisions(ctl) == {"svc": 2}
 
 
+def test_bounds_hold_when_placement_unresolvable(
+    fake_slo, fake_k8s, fake_signals, clock, cr_spec,
+):
+    """A service skipped before step() still serves inside the CR's
+    current bounds — suspending must not wait for the workload read."""
+    _boot(fake_k8s, fake_signals)
+    ctl = _mk_ctl(fake_slo, fake_k8s, fake_signals, clock, cr_spec)
+    ctl.tick()
+    assert _decisions(ctl) == {"svc": 2}
+
+    fake_k8s.placements[("ns", "svc")] = None
+    suspended = dict(cr_spec)
+    suspended["minimumDeployment"] = {"type": "replica", "value": 0}
+    suspended["maximumDeployment"] = {"type": "replica", "value": 0}
+    fake_slo.set("ns", "svc", suspended)
+    clock.advance(60)
+    ctl.tick()
+    assert _decisions(ctl) == {"svc": 0}
+
+
+def test_failed_tick_republishes_within_bounds(
+    fake_slo, fake_k8s, fake_signals, clock, cr_spec,
+):
+    """A tick that aborts on the pool read must not leave a row the
+    CR's new bounds forbid on the wire."""
+    _boot(fake_k8s, fake_signals)
+    ctl = _mk_ctl(fake_slo, fake_k8s, fake_signals, clock, cr_spec)
+    ctl.tick()
+    assert _decisions(ctl) == {"svc": 2}
+
+    class Boom:
+        def pool_capacity(self):
+            raise RuntimeError("k8s down")
+    ctl.k8s = Boom()
+    raised = dict(cr_spec)
+    raised["minimumDeployment"] = {"type": "replica", "value": 5}
+    fake_slo.set("ns", "svc", raised)
+    clock.advance(60)
+    with pytest.raises(RuntimeError):
+        ctl.tick()
+    assert _decisions(ctl) == {"svc": 5}
+
+
+def test_resume_from_zero(
+    fake_slo, fake_k8s, fake_signals, clock, cr_spec,
+):
+    """Suspend with min=max=0, workload drains to zero ready replicas,
+    resume with min=1: the decision comes back to 1."""
+    _boot(fake_k8s, fake_signals)
+    ctl = _mk_ctl(fake_slo, fake_k8s, fake_signals, clock, cr_spec)
+    ctl.tick()
+    suspended = dict(cr_spec)
+    suspended["minimumDeployment"] = {"type": "replica", "value": 0}
+    suspended["maximumDeployment"] = {"type": "replica", "value": 0}
+    fake_slo.set("ns", "svc", suspended)
+    clock.advance(60)
+    ctl.tick()
+    assert _decisions(ctl) == {"svc": 0}
+
+    fake_signals.set_replicas_ready(0)
+    fake_slo.set("ns", "svc", cr_spec)
+    clock.advance(60)
+    ctl.tick()
+    assert _decisions(ctl) == {"svc": 1}
+
+
 def test_not_ready_until_first_tick(
     fake_slo, fake_k8s, fake_signals, clock, cr_spec,
 ):

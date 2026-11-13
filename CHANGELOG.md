@@ -8,6 +8,19 @@ no `v` prefix; each tag publishes the image
 
 ## [Unreleased]
 
+### Fixed
+- The SLO CR's `[min, max]` is respected on every row `/decisions` serves.
+  A tick that skipped a service served its last count whatever the CR now
+  said: a service resumed from `min = max = 0` stayed at 0 while its
+  workload had no ready replicas, and a suspend or a lowered max did not
+  apply while `replicas_ready` was missing, the workload could not be
+  read, or the tick failed. Bounds are now applied to every live service
+  at the start of each tick, a failed tick republishes those values, and
+  a row still outside its bounds is omitted with an error log.
+- A pdengine service whose shape cannot be walked into its CR window is
+  no longer compressed to 1p1d when that is below the window's min; it is
+  omitted. The bounds fix also applies on ticks with no physical data.
+
 ## [0.8.1] - 2026-11-04
 
 ### Fixed

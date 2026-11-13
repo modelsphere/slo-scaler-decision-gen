@@ -172,6 +172,29 @@ class ServiceView:
         self.committed = None
         self.comfortable_since = None
 
+    # ---------- CR bounds (R9) ----------
+
+    def enforce_bounds(self, cr_spec, now):
+        """Pull a replica-currency `committed` into the CR's [min, max].
+
+        Runs ahead of every skip path — the controller calls it for
+        each live CR before anything can fail, and `step` before its
+        no-physical guard — so a skipped tick still serves inside the
+        bounds (suspend at min=max=0, resume at min≥1). Bypasses
+        cooldowns, freezes and missing-signal holds; CR is authority.
+        pdengine bounds need the live shape and are `_step_pd`'s job;
+        a currency mismatch is left for `step` to reset."""
+        bounds = _bounds(cr_spec)
+        if (bounds is None or self.committed is None
+                or _bounds_kind(cr_spec) == "pdengine"
+                or hasattr(self.committed, "prefill")):
+            return
+        mn, mx, _ = bounds
+        if self.committed > mx:
+            self.commit(mx, now, cause="cr-max-shrink")
+        elif self.committed < mn:
+            self.commit(mn, now, cause="cr-min-raise")
+
     # ---------- boot (R7) ----------
 
     def _ensure_seeded(self, cr_spec, placement, now):
@@ -266,6 +289,48 @@ class ServiceView:
         if self.committed is None:
             self.commit(live, now, cause="boot-seed")
 
+        lo, hi = pd.per_slice_window(mn, mx, spec.slices)
+        # Bounds-fix only fires when *committed* has drifted outside
+        # the window — never to absorb routine live drift. In-window
+        # differences between live and committed are the SLO/margin
+        # layer's business, not the bounds layer's. It runs before the
+        # no-physical hold below so that hold never serves a shape the
+        # CR forbids.
+        if not (lo <= self.committed.engines <= hi):
+            fixed = pd.correct_to_bounds(
+                live.prefill, live.decode, lo, hi,
+            )
+            # correct_to_bounds refuses below the ≥1-per-role floor.
+            # Bounds that tight are a configuration emergency, not a
+            # reason to vanish from the wire: compress to the smallest
+            # liveable shape, log loudly, and let the CR author notice
+            # that bounds and live shape disagree. Only when 1p1d is
+            # itself inside the window — otherwise omit (R9).
+            if fixed is None and lo <= 2 <= hi:
+                log.error(
+                    "%s/%s: pdengine bounds min=%d max=%d (per-slice "
+                    "%s..%s) cannot express live shape %dp%dd; "
+                    "compressing to 1p1d rather than dropping the "
+                    "service from /decisions",
+                    self.ns, self.service, mn, mx, lo, hi,
+                    live.prefill, live.decode,
+                )
+                fixed = pd.PdShape(1, 1, 2)
+        else:
+            fixed = None
+        if fixed is None and not (lo <= self.committed.engines <= hi):
+            log.error(
+                "%s/%s: pdengine bounds min=%d max=%d (per-slice %s..%s) "
+                "violate live shape %dp%dd; omitting service from "
+                "/decisions rather than emitting a bound-breaking shape",
+                self.ns, self.service, mn, mx, lo, hi,
+                live.prefill, live.decode,
+            )
+            return self._pd_skip(placement, physical, now,
+                                  f"hold-pdengine-bounds min={mn} max={mx}")
+        if fixed is not None and fixed != self.committed:
+            self.commit(fixed, now, cause="pd-bounds-fix")
+
         if physical is None or physical == 0:
             # Transient bodylog lull. Serve the last committed shape
             # rather than dropping the row from the wire — same
@@ -292,45 +357,6 @@ class ServiceView:
                 pd_pool=None,
                 pd_shape=self.committed,
             )
-
-        lo, hi = pd.per_slice_window(mn, mx, spec.slices)
-        # Bounds-fix only fires when *committed* has drifted outside
-        # the window — never to absorb routine live drift. In-window
-        # differences between live and committed are the SLO/margin
-        # layer's business, not the bounds layer's.
-        if not (lo <= self.committed.engines <= hi):
-            fixed = pd.correct_to_bounds(
-                live.prefill, live.decode, lo, hi,
-            )
-            # correct_to_bounds refuses below the ≥1-per-role floor.
-            # Bounds that tight are a configuration emergency, not a
-            # reason to vanish from the wire: compress to the smallest
-            # liveable shape, log loudly, and let the CR author notice
-            # that bounds and live shape disagree.
-            if fixed is None and hi >= 2:
-                log.error(
-                    "%s/%s: pdengine bounds min=%d max=%d (per-slice "
-                    "%s..%s) cannot express live shape %dp%dd; "
-                    "compressing to 1p1d rather than dropping the "
-                    "service from /decisions",
-                    self.ns, self.service, mn, mx, lo, hi,
-                    live.prefill, live.decode,
-                )
-                fixed = pd.PdShape(1, 1, 2)
-        else:
-            fixed = None
-        if fixed is None and not (lo <= self.committed.engines <= hi):
-            log.error(
-                "%s/%s: pdengine bounds min=%d max=%d (per-slice %s..%s) "
-                "violate live shape %dp%dd; omitting service from "
-                "/decisions rather than emitting a bound-breaking shape",
-                self.ns, self.service, mn, mx, lo, hi,
-                live.prefill, live.decode,
-            )
-            return self._pd_skip(placement, physical, now,
-                                  f"hold-pdengine-bounds min={mn} max={mx}")
-        if fixed is not None and fixed != self.committed:
-            self.commit(fixed, now, cause="pd-bounds-fix")
 
         # ---- verdicts + comfort streak (same algebra as LLM path)
         verdicts, missing_slo = self._llm_verdicts(readings, cr_spec)
@@ -539,6 +565,9 @@ class ServiceView:
         # which includes whole classes of workloads that never had the
         # LLM exporter (jobs being the first example).
         self._ensure_seeded(cr_spec, placement, now)
+        # C4 / R9: a CR bound change lands this tick, before the skip
+        # below — a suspended workload reads physical=0 on resume.
+        self.enforce_bounds(cr_spec, now)
         if physical is None or physical == 0:
             empty_verdicts = {"queue": {}} if kind == "job" else {"ttft": {}, "otps": {}}
             return Transition(
@@ -561,13 +590,6 @@ class ServiceView:
                 pd_shape=None,
             )
         mn, mx, _pri = bounds
-
-        # C4: CR max shrunk below committed → compress immediately.
-        # Bypasses cooldowns, freezes, missing-signal holds; CR is
-        # authority. Goes through commit() so clock stamps and comfort
-        # zeroes.
-        if self.committed > mx:
-            self.commit(mx, now, cause="cr-max-shrink")
 
         is_job = (kind == "job")
 
@@ -752,6 +774,26 @@ class ServiceView:
             pd_pool=None,
             pd_shape=pd_shape,
         )
+
+
+def within_bounds(committed, cr_spec, pd_spec=None):
+    """True iff `committed` may go on the wire under `cr_spec` (R9).
+
+    Replica currency: min ≤ committed ≤ max. pdengine: the engine total
+    sits in the per-slice window of the DS last resolved (`pd_spec`).
+    No max, no pd_spec for an engine bound, or a currency that doesn't
+    match the CR's type → False: a row we can't check is a row we omit."""
+    bounds = _bounds(cr_spec)
+    if bounds is None or committed is None:
+        return False
+    mn, mx, _ = bounds
+    is_pd = hasattr(committed, "prefill")
+    if _bounds_kind(cr_spec) == "pdengine":
+        if not is_pd or pd_spec is None:
+            return False
+        lo, hi = pd.per_slice_window(mn, mx, pd_spec.slices)
+        return lo is not None and lo <= committed.engines <= hi
+    return not is_pd and mn <= committed <= mx
 
 
 def _fmt_committed(n):

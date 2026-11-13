@@ -16,8 +16,13 @@ bug by definition.
 Failure posture (arch §5):
   - slo snapshot:        free ledger entries for deleted CRs before
                          gap computation (C7).
-  - pool capacity read:  exception → abort tick; keep previous snapshot.
-  - placement unreadable for S: skip S that tick (no decision row).
+  - CR bounds (R9):      never served outside. Every live view is
+                         clamped before anything can skip or abort, and
+                         publish omits any row still outside.
+  - pool capacity read:  exception → abort tick; republish the ledger
+                         (previous values, clamped to current bounds).
+  - placement unreadable for S: skip S that tick; S keeps its last
+                         committed row, clamped to current bounds.
   - SLO signal missing:  serviceview holds S at committed (per S, not
                          global).
   - replicas_ready missing: serviceview falls back to committed for
@@ -32,7 +37,7 @@ import time
 
 from decision_gen import pd, planner, snapshot as wire
 from decision_gen.serviceview import (
-    ServiceView, _bounds, _bounds_kind, _fmt_committed,
+    ServiceView, _bounds, _bounds_kind, _fmt_committed, within_bounds,
 )
 from decision_gen.thresholds import Verdict
 
@@ -156,6 +161,22 @@ class Controller:
             self._pd_specs.pop(key, None)
             log.info("%s/%s: CR deleted; freed ledger entry", *key)
 
+        # R9: pull every live view into its CR's current bounds before
+        #    anything below can skip it or abort the tick. The publish
+        #    in `finally` then serves those values even when the tick
+        #    fails, instead of a snapshot the CRs no longer allow.
+        #    Job CRs win a key collision, as in the step order below.
+        specs = {**crs, **crs_job}
+        for key, view in self._views.items():
+            view.enforce_bounds(specs[key], now)
+
+        try:
+            self._decide(now, crs, crs_job, t0)
+        finally:
+            self._publish(specs)
+
+    def _decide(self, now, crs, crs_job, t0):
+        """Steps 2-6 of the tick: per-service step, planner, commit."""
         # Merge both kinds into one iteration. Placement, bounds,
         # planner input, and the transition format are shared; only the
         # readings dict shape differs (view.step() dispatches on the
@@ -164,8 +185,6 @@ class Controller:
         merged += [(k, s, "job") for k, s in sorted(crs_job.items())]
 
         if not merged:
-            with self._lock:
-                self._snapshot = wire.to_wire({})
             return
 
         # 2. Pool capacity. Failure aborts the whole tick.
@@ -366,6 +385,9 @@ class Controller:
         for t in transitions:
             log.info("tick %s/%s %s", t.ns, t.service, _fmt_transition(t))
 
+    def _publish(self, specs):
+        """Rebuild the served snapshot from the ledger. Runs at the end
+        of every tick, including one that raised."""
         # Serve every tracked view, including ones skipped this tick —
         # a temporarily-no-physical service must not vanish from the wire
         # (the executor would read absence differently from "same value").
@@ -373,11 +395,20 @@ class Controller:
         # dropped from self._views by _drop_pd_view above. A pdengine
         # row whose DS is unreadable renders against the PDSpec the
         # controller last resolved, not nulls.
-        committed = {
-            key: v.committed
-            for key, v in self._views.items()
-            if v.committed is not None      # never-seeded: nothing to serve
-        }
+        committed = {}
+        for key, v in self._views.items():
+            if v.committed is None:         # never-seeded: nothing to serve
+                continue
+            # R9 backstop: a row outside the CR's bounds is omitted,
+            # never served. The paths above keep committed in bounds;
+            # this is where a missed one becomes visible.
+            if not within_bounds(v.committed, specs.get(key),
+                                 self._pd_specs.get(key)):
+                log.error("%s/%s: committed %s not within the CR's "
+                          "bounds (or CR has none); omitting from /decisions",
+                          key[0], key[1], _fmt_committed(v.committed))
+                continue
+            committed[key] = v.committed
         with self._lock:
             self._snapshot = wire.to_wire(committed, self._pd_specs)
         log.info(
